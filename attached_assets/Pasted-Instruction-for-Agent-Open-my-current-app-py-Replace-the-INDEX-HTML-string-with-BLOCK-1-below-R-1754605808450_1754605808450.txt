@@ -1,179 +1,15 @@
-import os
-import time
-import json
-from urllib import request as urlreq
-from urllib.error import URLError, HTTPError
-import re
-from textwrap import dedent
-import random
-from flask import Flask, request, jsonify, Response
+Instruction for Agent:
+Open my current app.py.
 
-app = Flask(__name__)
-app.secret_key = os.environ.get("SESSION_SECRET")
+Replace the INDEX_HTML string with BLOCK 1 below.
 
-# ---------------------------
-# Prompt Enhancement Engine
-# ---------------------------
+Replace the helper _build_default_sdxl_workflow and the /generate/comfy route with BLOCK 2 below.
+Do not remove any other code.
 
-# Quality, style, mood terms for consistent categorization
-STYLE_KEYWORDS = {
-    "quality": ["masterpiece", "best quality", "ultra high detail", "8k", "4k", "highres", "ultra detailed", "extremely detailed", "intricate", "sharp focus", "professional"],
-    "art_styles": ["photorealistic", "hyperrealistic", "cinematic", "digital art", "oil painting", "watercolor", "anime", "manga", "concept art", "impressionist", "baroque", "renaissance", "art nouveau", "cyberpunk", "steampunk", "minimalist"],
-    "photography": ["bokeh", "depth of field", "macro", "wide angle", "telephoto", "portrait", "landscape", "street photography", "documentary", "fashion photography"],
-    "lighting": ["soft lighting", "hard lighting", "natural lighting", "studio lighting", "golden hour", "blue hour", "backlighting", "rim lighting", "volumetric lighting", "chiaroscuro"],
-    "composition": ["rule of thirds", "centered", "symmetrical", "leading lines", "framing", "negative space", "close-up", "medium shot", "wide shot", "bird's eye view", "worm's eye view"],
-    "mood": ["moody", "dramatic", "serene", "melancholic", "uplifting", "mysterious", "romantic", "energetic", "peaceful", "tense", "nostalgic", "futuristic"],
-    "color_grades": ["vibrant", "desaturated", "monochrome", "sepia", "teal and orange", "warm tones", "cool tones", "high contrast", "low contrast", "film grain"]
-}
-
-# Comprehensive negative defaults
-NEGATIVE_DEFAULT = ["lowres", "bad anatomy", "bad hands", "text", "error", "missing fingers", "extra digit", "fewer digits", "cropped", "worst quality", "low quality", "normal quality", "jpeg artifacts", "signature", "watermark", "username", "blurry", "bad feet", "cropped", "poorly drawn hands", "poorly drawn face", "mutation", "deformed", "worst quality", "low quality", "normal quality", "jpeg artifacts", "signature", "watermark", "extra fingers", "fewer digits", "extra limbs", "extra arms", "extra legs", "malformed limbs", "fused fingers", "too many fingers", "long neck", "cross-eyed", "mutated hands", "polar lowres", "bad body", "bad proportions", "gross proportions", "text", "error", "missing fingers", "missing arms", "missing legs", "extra digit", "extra arms", "extra leg", "extra foot"]
-
-# Aspect ratio mappings
-AR_TO_RES = {"1:1": (1024, 1024), "16:9": (1344, 768), "9:16": (768, 1344), "2:3": (832, 1216), "3:2": (1216, 832)}
-
-# Common stopwords to filter out
-STOPWORDS = set("""
-a an the of and to in on at by for with from into over under between
-is are was were be been being do does did have has had can will would should
-this that these those as if then than so such very really just it its it's
-""".split())
-
-# ---------------------------
-# Core Processing Functions
-# ---------------------------
-
-def tokenize(text):
-    """Extract alphanumeric tokens from text."""
-    return re.findall(r"[A-Za-z0-9\-+/#']+", text.lower())
-
-def dedup_preserve(seq):
-    """Remove duplicates while preserving order."""
-    seen = set()
-    out = []
-    for x in seq:
-        if x not in seen and x:
-            seen.add(x)
-            out.append(x)
-    return out
-
-def clamp_length(s, max_chars=850):
-    """Prevent overly long prompts that degrade quality."""
-    return (s[:max_chars] + "…") if len(s) > max_chars else s
-
-def extract_categories(user_text: str):
-    """Extract style keywords and subject terms from user input."""
-    words = tokenize(user_text)
-    text = user_text.lower()
-
-    found = {k: [] for k in STYLE_KEYWORDS}
-    for k, arr in STYLE_KEYWORDS.items():
-        for term in arr:
-            if term in text:
-                found[k].append(term)
-
-    # Extract likely subject terms (non-style, non-stopword)
-    all_style = set()
-    for arr in STYLE_KEYWORDS.values():
-        all_style.update(arr)
-    subject_terms = [w for w in words if w not in STOPWORDS and w not in all_style and len(w) > 2]
-
-    return found, subject_terms
-
-def build_positive(subject_terms, found, extras):
-    """Construct optimized positive prompt with strict order: quality → subject → style → lighting → composition → mood → color grade → extra tags."""
-    # Strict order as specified
-    quality = ", ".join(dedup_preserve(found["quality"][:3])) or "masterpiece, best quality, highly detailed"
-    subject = ", ".join(subject_terms[:5]) if subject_terms else "primary subject"
-    style = ", ".join(dedup_preserve(found["art_styles"][:2] + found["photography"][:2]))
-    lighting = extras.get("lighting", "").strip()
-    if not lighting:
-        lighting = ", ".join(found["lighting"][:2])
-    composition = ", ".join(found["composition"][:2])
-    mood = ", ".join(found["mood"][:2])
-    color_grade = extras.get("color_grade", "").strip()
-    if not color_grade:
-        color_grade = ", ".join(found["color_grades"][:2])
-    extra_tags = extras.get("extra_tags", "").strip()
-
-    # Combine in strict order
-    parts = [quality, subject, style, lighting, composition, mood, color_grade, extra_tags]
-    parts = [p for p in parts if p.strip()]
-    result = ", ".join(parts)
-    return clamp_length(result)
-
-def build_negative(user_negative):
-    """Construct enhanced negative prompt covering anatomy/structure, artifacts/quality, branding/text, style pitfalls."""
-    user_list = []
-    if user_negative:
-        user_list = [x.strip() for x in user_negative.split(",") if x.strip()]
-    neg = dedup_preserve(NEGATIVE_DEFAULT + user_list)
-    neg = ", ".join(neg)
-    return clamp_length(neg)
-
-def sdxl_prompt(positive, negative, ar):
-    """Generate SDXL-optimized prompt configuration."""
-    w, h = AR_TO_RES.get(ar, (1024, 1024))
-    return {
-        "positive": positive,
-        "negative": negative,
-        "settings": {
-            "width": w,
-            "height": h,
-            "steps": 25,
-            "cfg_scale": 7.0,
-            "seed": -1,
-            "sampler": "DPM++ 2M Karras"
-        }
-    }
-
-def comfyui_recipe(positive, negative, ar):
-    """Generate ComfyUI workflow configuration with execution tips."""
-    w, h = AR_TO_RES.get(ar, (1024, 1024))
-    return {
-        "positive": positive,
-        "negative": negative,
-        "nodes_hint": {
-            "KSampler": {"steps": 25, "cfg": 7.0, "sampler_name": "dpmpp_2m", "scheduler": "karras"},
-            "EmptyLatentImage": {"width": w, "height": h, "batch_size": 1},
-            "CheckpointLoaderSimple": {"ckpt_name": "sd_xl_base_1.0.safetensors"}
-        },
-        "execution_tips": [
-            "Use SDXL base model for best results",
-            "Enable 'Tiled VAE' if getting VRAM errors",
-            "Consider refiner model for final 20% of steps"
-        ]
-    }
-
-def midjourney_prompt(positive, ar):
-    """Generate Midjourney v6 prompt string."""
-    ar_flag = f"--ar {ar}"
-    # Replace "8k" with "ultra high detail" for MJ compatibility
-    clean_positive = positive.replace("8k", "ultra high detail")
-    return f"{clean_positive} --v 6 {ar_flag} --stylize 200 --chaos 5"
-
-def pika_prompt(positive):
-    """Generate Pika Labs video prompt configuration."""
-    return {
-        "prompt": f"{positive}, animated micro-details, smooth motion, temporal consistency",
-        "motion": "subtle camera push-in, natural parallax, no warping",
-        "duration_sec": 6,
-        "guidance": 7.0
-    }
-
-def runway_prompt(positive):
-    """Generate Runway ML video prompt configuration."""
-    return {
-        "text_prompt": f"{positive}",
-        "camera_motion": "push_in",
-        "motion_strength": "medium",
-        "duration_sec": 5,
-        "notes": "Keep subject centrally framed to reduce morphing."
-    }
-
-# ---------------------------
-# Routes
-# ---------------------------
+BLOCK 1 — New INDEX_HTML (adds Advanced controls + passes them to generation)
+python
+Copy
+Edit
 INDEX_HTML = """
 <!doctype html>
 <html lang="en">
@@ -616,54 +452,12 @@ document.addEventListener('DOMContentLoaded', loadAllPresets);
 </body>
 </html>
 """
-
-@app.route("/")
-def index():
-    return Response(INDEX_HTML, mimetype="text/html")
-
-def _optimize_core(data):
-    user_text = (data.get("idea") or "").strip()
-    user_negative = (data.get("negative") or "").strip()
-    aspect_ratio = (data.get("aspect_ratio") or "1:1").strip()
-    extras = {
-        "lighting": (data.get("lighting") or "").strip(),
-        "color_grade": (data.get("color_grade") or "").strip(),
-        "extra_tags": (data.get("extra_tags") or "").strip(),
-    }
-    if not user_text:
-        return {"error": "Please describe your idea."}, 400
-
-    found, subject_terms = extract_categories(user_text)
-    positive = build_positive(subject_terms, found, extras)
-    negative = build_negative(user_negative)
-
-    out = {
-        "unified": {"positive": positive, "negative": negative},
-        "sdxl": sdxl_prompt(positive, negative, aspect_ratio),
-        "comfyui": comfyui_recipe(positive, negative, aspect_ratio),
-        "midjourney": midjourney_prompt(positive, aspect_ratio),
-        "pika": pika_prompt(positive),
-        "runway": runway_prompt(positive),
-        "hints": {
-            "faces": "For better faces: Add 'portrait, detailed face, sharp focus' and avoid 'bad anatomy' in negative",
-            "motion": "For video: Use motion cues like 'gentle camera movement' but avoid 'warping, morphing'",
-            "busy": "If output is too busy: Reduce adjectives and focus on 1-2 key elements"
-        }
-    }
-    return out, 200
-
-@app.route("/optimize", methods=["POST"])
-def optimize():
-    try:
-        data = request.get_json() or {}
-        result, status_code = _optimize_core(data)
-        return jsonify(result), status_code
-    except Exception as e:
-        return jsonify({"error": f"Server error: {e}"}), 500
-
-@app.route("/api/optimize", methods=["POST"])
-def api_optimize():
-    return optimize()
+BLOCK 2 — Update workflow helper + /generate/comfy to honor advanced controls
+python
+Copy
+Edit
+# add near top of file with other imports if not present
+import random
 
 def _build_default_sdxl_workflow(pos, neg, w, h, steps=30, cfg=6.5, sampler="dpmpp_2m", seed=123456789, batch_size=1):
     """
@@ -686,19 +480,7 @@ def _build_default_sdxl_workflow(pos, neg, w, h, steps=30, cfg=6.5, sampler="dpm
       "19": {"class_type": "CLIPLoader", "inputs": {"clip_name": "sdxl_clip.safetensors"}}
     }
 
-def _http_post_json(url, data):
-    """Helper for POST requests with JSON."""
-    req = urlreq.Request(url, data=json.dumps(data).encode(), headers={"Content-Type": "application/json"})
-    with urlreq.urlopen(req, timeout=30) as response:
-        return json.loads(response.read().decode())
-
-def _http_get_json(url):
-    """Helper for GET requests returning JSON."""
-    req = urlreq.Request(url)
-    with urlreq.urlopen(req, timeout=10) as response:
-        return json.loads(response.read().decode())
-
-@app.route("/generate/comfy", methods=["POST"])
+@app.post("/generate/comfy")
 def generate_comfy():
     """
     Body: {
@@ -770,7 +552,7 @@ def generate_comfy():
                     for key in ("text","text_g","text_l"):
                         if key in node.get("inputs", {}):
                             node["inputs"][key] = positive
-                if ctype.startswith("emptylatentimage"):
+                if ctype.startswith("empt ylatentimage".replace(" ", "")):  # safety for typos
                     node["inputs"]["width"]  = w
                     node["inputs"]["height"] = h
                     node["inputs"]["batch_size"] = int(batch)
@@ -823,7 +605,3 @@ def generate_comfy():
         return jsonify({"error": f"Network error contacting ComfyUI: {e}"}), 502
     except Exception as e:
         return jsonify({"error": f"Unexpected error: {e}"}), 500
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
