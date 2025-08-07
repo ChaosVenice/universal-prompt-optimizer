@@ -221,15 +221,19 @@ INDEX_HTML = """
 h1{margin:0 0 6px;font-size:28px}.sub{margin:0 0 18px;color:#9fb2c7}
 label{display:block;font-size:14px;color:#a9bdd4;margin-bottom:6px}
 textarea,input,select{width:100%;padding:10px 12px;border-radius:10px;border:1px solid #243447;background:#0f141c;color:#e7edf5}
-textarea::placeholder,input::placeholder{color:#627a91}.row{display:flex;gap:12px;margin-top:12px}.col{flex:1}
-button{margin-top:14px;padding:10px 14px;background:#2f6df6;border:none;border-radius:10px;color:#fff;font-weight:600;cursor:pointer}
-button:hover{filter:brightness(1.05)}.results{margin-top:22px}.hidden{display:none}
+textarea::placeholder,input::placeholder{color:#627a91}.row{display:flex;gap:12px;margin-top:12px;flex-wrap:wrap}.col{flex:1;min-width:260px}
+button{margin-top:10px;padding:10px 14px;background:#2f6df6;border:none;border-radius:10px;color:#fff;font-weight:600;cursor:pointer}
+button.secondary{background:#1e293b}button.danger{background:#9b1c1c}
+button:hover{filter:brightness(1.05)}
+.results{margin-top:22px}.hidden{display:none}
 .box{background:#0f141c;border:1px solid #1f2a3a;padding:12px;border-radius:10px;white-space:pre-wrap}
 .section{margin-top:14px}.rowbtns{display:flex;gap:8px;flex-wrap:wrap}
 .kv{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;color:#bcd0e3}
-.small{font-size:12px;color:#7f93a7}.badge{display:inline-block;padding:4px 8px;border:1px solid #2d3b4e;border-radius:999px;margin-right:6px;color:#a9bdd4}
+small,.small{font-size:12px;color:#7f93a7}.badge{display:inline-block;padding:4px 8px;border:1px solid #2d3b4e;border-radius:999px;margin-right:6px;color:#a9bdd4}
 footer{margin-top:24px;text-align:center;color:#6f859c;font-size:12px}
 h3{margin:8px 0}
+select, input[type="text"] {height:40px}
+textarea {min-height:110px}
 </style>
 </head>
 <body>
@@ -237,11 +241,12 @@ h3{margin:8px 0}
   <h1>Universal Prompt Optimizer</h1>
   <p class="sub">Turn rough ideas into model-ready prompts for SDXL, ComfyUI, Midjourney, Pika, and Runway. Built for speed + consistency.</p>
 
+  <!-- INPUTS -->
   <div class="card">
     <div class="row">
       <div class="col">
         <label>Your idea</label>
-        <textarea id="idea" rows="6" placeholder="e.g., A cozy coffee shop at golden hour, rain outside, cinematic lighting, moody vibe, shallow depth of field, candid couple"></textarea>
+        <textarea id="idea" placeholder="e.g., A cozy coffee shop at golden hour, rain outside, cinematic lighting, moody vibe, shallow depth of field, candid couple"></textarea>
       </div>
     </div>
 
@@ -271,13 +276,13 @@ h3{margin:8px 0}
         <label>Color grade (optional)</label>
         <input id="color_grade" placeholder="e.g., teal and orange, Kodak Portra 400, moody grade">
       </div>
-    </div>
-
-    <div class="row">
       <div class="col">
         <label>Extra tags (optional)</label>
         <input id="extra_tags" placeholder="e.g., film grain, depth of field, subsurface scattering">
       </div>
+    </div>
+
+    <div class="row">
       <div class="col small">
         <span class="badge">Tip</span> Keep nouns concrete. Add one clear mood + one lighting cue for best control.
       </div>
@@ -286,6 +291,30 @@ h3{margin:8px 0}
     <button id="run">Optimize</button>
   </div>
 
+  <!-- PRESETS -->
+  <div class="card">
+    <h3>Presets</h3>
+    <div class="row">
+      <div class="col">
+        <label>Preset name</label>
+        <input id="presetName" placeholder="e.g., Neon Alley Cinematic">
+      </div>
+      <div class="col">
+        <label>Load preset</label>
+        <select id="presetSelect"></select>
+      </div>
+    </div>
+    <div class="rowbtns" style="margin-top:10px">
+      <button class="secondary" onclick="savePreset()">Save Preset</button>
+      <button class="secondary" onclick="loadPreset()">Load</button>
+      <button class="danger" onclick="deletePreset()">Delete</button>
+      <button class="secondary" onclick="exportPresets()">Export JSON</button>
+      <button class="secondary" onclick="importPresets()">Import JSON</button>
+    </div>
+    <small>Presets store: idea, negative, aspect ratio, lighting, color grade, extra tags. Saved locally in your browser.</small>
+  </div>
+
+  <!-- RESULTS -->
   <div id="results" class="results hidden">
     <div class="card">
       <h3>Unified Prompt</h3>
@@ -341,6 +370,111 @@ h3{margin:8px 0}
   <footer>Seed tip: lock a seed for reproducibility; vary only seed to explore variants without wrecking the look.</footer>
 </div>
 <script>
+const LS_KEY = 'upo_presets_v1';
+
+function getForm(){
+  return {
+    idea: document.getElementById('idea').value.trim(),
+    negative: document.getElementById('negative').value.trim(),
+    aspect_ratio: document.getElementById('ar').value,
+    lighting: document.getElementById('lighting').value.trim(),
+    color_grade: document.getElementById('color_grade').value.trim(),
+    extra_tags: document.getElementById('extra_tags').value.trim(),
+  };
+}
+function setForm(v){
+  if(!v) return;
+  document.getElementById('idea').value = v.idea || '';
+  document.getElementById('negative').value = v.negative || '';
+  document.getElementById('ar').value = v.aspect_ratio || '16:9';
+  document.getElementById('lighting').value = v.lighting || '';
+  document.getElementById('color_grade').value = v.color_grade || '';
+  document.getElementById('extra_tags').value = v.extra_tags || '';
+}
+
+function loadAllPresets(){
+  try{
+    const raw = localStorage.getItem(LS_KEY);
+    const map = raw ? JSON.parse(raw) : {};
+    const sel = document.getElementById('presetSelect');
+    sel.innerHTML = '';
+    const keys = Object.keys(map).sort((a,b)=>a.localeCompare(b));
+    keys.forEach(name=>{
+      const opt = document.createElement('option');
+      opt.value = name; opt.textContent = name;
+      sel.appendChild(opt);
+    });
+  }catch(e){ console.warn('Failed to load presets', e); }
+}
+
+function savePreset(){
+  const name = (document.getElementById('presetName').value || '').trim();
+  if(!name){ alert('Name your preset first.'); return; }
+  try{
+    const raw = localStorage.getItem(LS_KEY);
+    const map = raw ? JSON.parse(raw) : {};
+    map[name] = getForm();
+    localStorage.setItem(LS_KEY, JSON.stringify(map));
+    loadAllPresets();
+    document.getElementById('presetSelect').value = name;
+  }catch(e){ alert('Could not save preset.'); }
+}
+
+function loadPreset(){
+  const sel = document.getElementById('presetSelect');
+  const name = sel.value;
+  if(!name){ alert('No preset selected.'); return; }
+  try{
+    const map = JSON.parse(localStorage.getItem(LS_KEY) || '{}');
+    setForm(map[name]);
+  }catch(e){ alert('Could not load preset.'); }
+}
+
+function deletePreset(){
+  const sel = document.getElementById('presetSelect');
+  const name = sel.value;
+  if(!name){ alert('No preset selected.'); return; }
+  if(!confirm(`Delete preset "${name}"?`)) return;
+  try{
+    const map = JSON.parse(localStorage.getItem(LS_KEY) || '{}');
+    delete map[name];
+    localStorage.setItem(LS_KEY, JSON.stringify(map));
+    loadAllPresets();
+  }catch(e){ alert('Could not delete preset.'); }
+}
+
+function exportPresets(){
+  try{
+    const raw = localStorage.getItem(LS_KEY) || '{}';
+    const blob = new Blob([raw], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = 'upo_presets.json'; a.click();
+    setTimeout(()=>URL.revokeObjectURL(url), 1000);
+  }catch(e){ alert('Could not export presets.'); }
+}
+
+function importPresets(){
+  const input = document.createElement('input');
+  input.type = 'file'; input.accept = 'application/json';
+  input.onchange = (e)=>{
+    const file = e.target.files[0];
+    if(!file) return;
+    const reader = new FileReader();
+    reader.onload = ()=>{
+      try{
+        const incoming = JSON.parse(reader.result);
+        const current = JSON.parse(localStorage.getItem(LS_KEY) || '{}');
+        const merged = Object.assign(current, incoming);
+        localStorage.setItem(LS_KEY, JSON.stringify(merged));
+        loadAllPresets();
+        alert('Presets imported.');
+      }catch(err){ alert('Invalid JSON.'); }
+    };
+    reader.readAsText(file);
+  };
+  input.click();
+}
+
 function copyText(id){
   const el = document.getElementById(id);
   const txt = el?.innerText || el?.textContent || '';
@@ -358,14 +492,7 @@ function downloadText(filename, id){
 }
 
 async function optimize(){
-  const payload = {
-    idea: document.getElementById('idea').value.trim(),
-    negative: document.getElementById('negative').value.trim(),
-    aspect_ratio: document.getElementById('ar').value,
-    lighting: document.getElementById('lighting').value.trim(),
-    color_grade: document.getElementById('color_grade').value.trim(),
-    extra_tags: document.getElementById('extra_tags').value.trim()
-  };
+  const payload = getForm();
   const res = await fetch('/optimize', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(payload)
@@ -387,7 +514,9 @@ async function optimize(){
   // Hints
   document.getElementById('hintsBox').textContent  = JSON.stringify(out.hints, null, 2);
 }
+
 document.getElementById('run').addEventListener('click', optimize);
+document.addEventListener('DOMContentLoaded', loadAllPresets);
 </script>
 </body>
 </html>
