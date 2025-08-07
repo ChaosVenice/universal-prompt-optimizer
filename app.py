@@ -223,18 +223,18 @@ def usage_charge():
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:5000")
 
 # Map Stripe Price IDs to key configuration
-# EDIT THESE to your actual Stripe Price IDs when ready to use payments
+# REPLACE THESE with your actual Stripe Price IDs from your Stripe Dashboard
 PLAN_MAP = {
-    # Example configurations - replace with your actual Stripe Price IDs:
-    # "price_1AbCdEfGhIjKlMnO": {"plan":"basic","daily_limit":50,"days_valid":30},
-    # "price_1XyZwVuTsRqPoNm": {"plan":"pro","daily_limit":200,"days_valid":30},
+    # Replace these example Price IDs with your actual ones:
+    "price_1ABC123EXAMPLE": {"plan":"basic","daily_limit":50,"days_valid":30},
+    "price_1XYZ789EXAMPLE": {"plan":"pro","daily_limit":200,"days_valid":30},
 }
 
-# Map human plan names -> Stripe Price IDs (edit these to match your products)
+# Map human plan names -> Stripe Price IDs (update these to match your actual products)
 PRICE_MAP = {
-    # Example configurations - replace with your actual plan mapping:
-    # "basic": "price_1AbCdEfGhIjKlMnO",
-    # "pro":   "price_1XyZwVuTsRqPoNm",
+    # Update these to match your actual Stripe Price IDs:
+    "basic": "price_1ABC123EXAMPLE",
+    "pro": "price_1XYZ789EXAMPLE",
 }
 
 STRIPE_API_KEY = os.getenv("STRIPE_API_KEY", "")
