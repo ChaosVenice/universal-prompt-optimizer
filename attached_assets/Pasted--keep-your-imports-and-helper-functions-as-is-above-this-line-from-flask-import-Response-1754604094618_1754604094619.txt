@@ -1,0 +1,168 @@
+# --- keep your imports and helper functions as-is above this line ---
+
+from flask import Response
+import os
+
+INDEX_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Universal Prompt Optimizer</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#0b0f14;color:#e7edf5}
+.container{max-width:980px;margin:36px auto;padding:0 16px}
+.card{background:#111826;border:1px solid #1f2a3a;border-radius:14px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.25);margin-bottom:16px}
+h1{margin:0 0 6px;font-size:28px}.sub{margin:0 0 18px;color:#9fb2c7}
+label{display:block;font-size:14px;color:#a9bdd4;margin-bottom:6px}
+textarea,input,select{width:100%;padding:10px 12px;border-radius:10px;border:1px solid #243447;background:#0f141c;color:#e7edf5}
+textarea::placeholder,input::placeholder{color:#627a91}.row{display:flex;gap:12px;margin-top:12px}.col{flex:1}
+button{margin-top:14px;padding:12px 16px;background:#2f6df6;border:none;border-radius:10px;color:#fff;font-weight:600;cursor:pointer}
+button:hover{filter:brightness(1.05)}.results{margin-top:22px}.hidden{display:none}
+#json{white-space:pre-wrap;background:#0f141c;border:1px solid #1f2a3a;padding:12px;border-radius:10px}
+.small{font-size:12px;color:#7f93a7}
+.badge{display:inline-block;padding:4px 8px;border:1px solid #2d3b4e;border-radius:999px;margin-right:6px;color:#a9bdd4}
+footer{margin-top:24px;text-align:center;color:#6f859c;font-size:12px}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Universal Prompt Optimizer</h1>
+  <p class="sub">Turn rough ideas into model-ready prompts for SDXL, ComfyUI, Midjourney, Pika, and Runway. Built for speed + consistency.</p>
+
+  <div class="card">
+    <div class="row">
+      <div class="col">
+        <label>Your idea</label>
+        <textarea id="idea" rows="6" placeholder="e.g., A cozy coffee shop at golden hour, rain outside, cinematic lighting, moody vibe, shallow depth of field, candid couple"></textarea>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="col">
+        <label>Negative prompt (optional)</label>
+        <input id="negative" placeholder="e.g., lowres, watermark, bad anatomy">
+      </div>
+      <div class="col">
+        <label>Aspect ratio</label>
+        <select id="ar">
+          <option selected>16:9</option>
+          <option>1:1</option>
+          <option>9:16</option>
+          <option>2:3</option>
+          <option>3:2</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="col">
+        <label>Lighting (optional)</label>
+        <input id="lighting" placeholder="e.g., soft studio lighting, volumetric light">
+      </div>
+      <div class="col">
+        <label>Color grade (optional)</label>
+        <input id="color_grade" placeholder="e.g., teal and orange, Kodak Portra 400, moody grade">
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="col">
+        <label>Extra tags (optional)</label>
+        <input id="extra_tags" placeholder="e.g., film grain, depth of field, subsurface scattering">
+      </div>
+      <div class="col small">
+        <span class="badge">Tip</span> Keep nouns concrete. Add one clear mood + one lighting cue for best control.
+      </div>
+    </div>
+
+    <button id="run">Optimize</button>
+  </div>
+
+  <div id="results" class="results hidden">
+    <div class="card">
+      <h3>Optimized Output</h3>
+      <div id="json"></div>
+    </div>
+  </div>
+
+  <footer>Seed tip: lock a seed for reproducibility; vary only seed to explore variants without wrecking the look.</footer>
+</div>
+<script>
+async function optimize(){
+  const payload = {
+    idea: document.getElementById('idea').value.trim(),
+    negative: document.getElementById('negative').value.trim(),
+    aspect_ratio: document.getElementById('ar').value,
+    lighting: document.getElementById('lighting').value.trim(),
+    color_grade: document.getElementById('color_grade').value.trim(),
+    extra_tags: document.getElementById('extra_tags').value.trim()
+  };
+  const res = await fetch('/optimize', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  });
+  const out = await res.json();
+  document.getElementById('results').classList.remove('hidden');
+  document.getElementById('json').textContent = JSON.stringify(out, null, 2);
+}
+document.getElementById('run').addEventListener('click', optimize);
+</script>
+</body>
+</html>
+"""
+
+@app.get("/")
+def index():
+    return Response(INDEX_HTML, mimetype="text/html")
+
+def _optimize_core(data):
+    user_text = (data.get("idea") or "").strip()
+    user_negative = (data.get("negative") or "").strip()
+    aspect_ratio = (data.get("aspect_ratio") or "1:1").strip()
+    extras = {
+        "lighting": (data.get("lighting") or "").strip(),
+        "color_grade": (data.get("color_grade") or "").strip(),
+        "extra_tags": (data.get("extra_tags") or "").strip(),
+    }
+    if not user_text:
+        return {"error": "Please describe your idea."}, 400
+
+    found, subject_terms = extract_categories(user_text)
+    positive = build_positive(subject_terms, found, extras)
+    negative = build_negative(user_negative)
+
+    out = {
+        "unified": {"positive": positive, "negative": negative},
+        "sdxl": sdxl_prompt(positive, negative, aspect_ratio),
+        "comfyui": comfyui_recipe(positive, negative, aspect_ratio),
+        "midjourney": midjourney_prompt(positive, aspect_ratio),
+        "pika": pika_prompt(positive),
+        "runway": runway_prompt(positive),
+        "hints": {
+            "prompt_order": "quality -> subject -> style -> lighting -> composition -> mood -> color grade -> extra tags",
+            "debug": "If outputs look busy, reduce adjectives, add a concrete noun, remove conflicting styles.",
+            "seed_strategy": "Lock a seed to compare variants; change only seed once composition is locked."
+        }
+    }
+    return out, 200
+
+# Web UI POST
+@app.post("/optimize")
+def optimize_ui():
+    data = request.get_json(force=True)
+    out, code = _optimize_core(data)
+    return jsonify(out), code
+
+# API alias to match your Agent
+@app.post("/api/optimize")
+def optimize_api():
+    data = request.get_json(force=True)
+    out, code = _optimize_core(data)
+    return jsonify(out), code
+
+if __name__ == "__main__":
+    # Honor PORT if Replit/Agent sets it; fall back to 8080 or 5000
+    port = int(os.getenv("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port, debug=False)

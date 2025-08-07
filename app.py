@@ -224,13 +224,10 @@ textarea,input,select{width:100%;padding:10px 12px;border-radius:10px;border:1px
 textarea::placeholder,input::placeholder{color:#627a91}.row{display:flex;gap:12px;margin-top:12px}.col{flex:1}
 button{margin-top:14px;padding:12px 16px;background:#2f6df6;border:none;border-radius:10px;color:#fff;font-weight:600;cursor:pointer}
 button:hover{filter:brightness(1.05)}.results{margin-top:22px}.hidden{display:none}
-#json{white-space:pre-wrap;background:#0f141c;border:1px solid #1f2a3a;padding:12px;border-radius:10px;font-family:Monaco,Consolas,'Lucida Console',monospace;font-size:13px;line-height:1.4}
+#json{white-space:pre-wrap;background:#0f141c;border:1px solid #1f2a3a;padding:12px;border-radius:10px}
 .small{font-size:12px;color:#7f93a7}
 .badge{display:inline-block;padding:4px 8px;border:1px solid #2d3b4e;border-radius:999px;margin-right:6px;color:#a9bdd4}
 footer{margin-top:24px;text-align:center;color:#6f859c;font-size:12px}
-.loading{opacity:0.6;pointer-events:none}
-.error{color:#ff6b6b;margin-top:8px;font-size:14px}
-h3{margin:0 0 12px;font-size:18px;color:#e7edf5}
 </style>
 </head>
 <body>
@@ -254,8 +251,8 @@ h3{margin:0 0 12px;font-size:18px;color:#e7edf5}
       <div class="col">
         <label>Aspect ratio</label>
         <select id="ar">
-          <option>1:1</option>
           <option selected>16:9</option>
+          <option>1:1</option>
           <option>9:16</option>
           <option>2:3</option>
           <option>3:2</option>
@@ -285,7 +282,6 @@ h3{margin:0 0 12px;font-size:18px;color:#e7edf5}
     </div>
 
     <button id="run">Optimize</button>
-    <div id="error" class="error hidden"></div>
   </div>
 
   <div id="results" class="results hidden">
@@ -299,62 +295,23 @@ h3{margin:0 0 12px;font-size:18px;color:#e7edf5}
 </div>
 <script>
 async function optimize(){
-  const button = document.getElementById('run');
-  const errorDiv = document.getElementById('error');
-  const resultsDiv = document.getElementById('results');
-  
-  // Reset error state
-  errorDiv.classList.add('hidden');
-  errorDiv.textContent = '';
-  
-  // Show loading state
-  button.textContent = 'Optimizing...';
-  button.classList.add('loading');
-  
-  try {
-    const payload = {
-      idea: document.getElementById('idea').value.trim(),
-      negative: document.getElementById('negative').value.trim(),
-      aspect_ratio: document.getElementById('ar').value,
-      lighting: document.getElementById('lighting').value.trim(),
-      color_grade: document.getElementById('color_grade').value.trim(),
-      extra_tags: document.getElementById('extra_tags').value.trim()
-    };
-    
-    const res = await fetch('/optimize', {
-      method: 'POST', 
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(payload)
-    });
-    
-    const out = await res.json();
-    
-    if (!res.ok) {
-      throw new Error(out.error || 'Optimization failed');
-    }
-    
-    resultsDiv.classList.remove('hidden');
-    document.getElementById('json').textContent = JSON.stringify(out, null, 2);
-    
-  } catch (error) {
-    errorDiv.textContent = error.message;
-    errorDiv.classList.remove('hidden');
-    resultsDiv.classList.add('hidden');
-  } finally {
-    // Reset button state
-    button.textContent = 'Optimize';
-    button.classList.remove('loading');
-  }
+  const payload = {
+    idea: document.getElementById('idea').value.trim(),
+    negative: document.getElementById('negative').value.trim(),
+    aspect_ratio: document.getElementById('ar').value,
+    lighting: document.getElementById('lighting').value.trim(),
+    color_grade: document.getElementById('color_grade').value.trim(),
+    extra_tags: document.getElementById('extra_tags').value.trim()
+  };
+  const res = await fetch('/optimize', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  });
+  const out = await res.json();
+  document.getElementById('results').classList.remove('hidden');
+  document.getElementById('json').textContent = JSON.stringify(out, null, 2);
 }
-
 document.getElementById('run').addEventListener('click', optimize);
-
-// Allow Enter key in textarea to trigger optimization
-document.getElementById('idea').addEventListener('keydown', function(e) {
-  if (e.ctrlKey && e.key === 'Enter') {
-    optimize();
-  }
-});
 </script>
 </body>
 </html>
@@ -362,100 +319,54 @@ document.getElementById('idea').addEventListener('keydown', function(e) {
 
 @app.route("/")
 def index():
-    """Serve the main application interface."""
     return Response(INDEX_HTML, mimetype="text/html")
 
+def _optimize_core(data):
+    user_text = (data.get("idea") or "").strip()
+    user_negative = (data.get("negative") or "").strip()
+    aspect_ratio = (data.get("aspect_ratio") or "1:1").strip()
+    extras = {
+        "lighting": (data.get("lighting") or "").strip(),
+        "color_grade": (data.get("color_grade") or "").strip(),
+        "extra_tags": (data.get("extra_tags") or "").strip(),
+    }
+    if not user_text:
+        return {"error": "Please describe your idea."}, 400
+
+    found, subject_terms = extract_categories(user_text)
+    positive = build_positive(subject_terms, found, extras)
+    negative = build_negative(user_negative)
+
+    out = {
+        "unified": {"positive": positive, "negative": negative},
+        "sdxl": sdxl_prompt(positive, negative, aspect_ratio),
+        "comfyui": comfyui_recipe(positive, negative, aspect_ratio),
+        "midjourney": midjourney_prompt(positive, aspect_ratio),
+        "pika": pika_prompt(positive),
+        "runway": runway_prompt(positive),
+        "hints": {
+            "prompt_order": "quality -> subject -> style -> lighting -> composition -> mood -> color grade -> extra tags",
+            "debug": "If outputs look busy, reduce adjectives, add a concrete noun, remove conflicting styles.",
+            "seed_strategy": "Lock a seed to compare variants; change only seed once composition is locked."
+        }
+    }
+    return out, 200
+
+# Web UI POST
 @app.route("/optimize", methods=["POST"])
-def optimize():
-    """Process user input and generate optimized prompts for all platforms."""
-    try:
-        data = request.get_json(force=True)
-        user_text = (data.get("idea") or "").strip()
-        user_negative = (data.get("negative") or "").strip()
-        aspect_ratio = (data.get("aspect_ratio") or "1:1").strip()
-        extras = {
-            "lighting": data.get("lighting", "").strip(),
-            "color_grade": data.get("color_grade", "").strip(),
-            "extra_tags": data.get("extra_tags", "").strip(),
-        }
+def optimize_ui():
+    data = request.get_json(force=True)
+    out, code = _optimize_core(data)
+    return jsonify(out), code
 
-        if not user_text:
-            return jsonify({"error": "Please describe your idea."}), 400
-
-        # Process the user input
-        found, subject_terms = extract_categories(user_text)
-        positive = build_positive(subject_terms, found, extras)
-        negative = build_negative(user_negative)
-
-        # Generate platform-specific outputs
-        output = {
-            "unified": {
-                "positive": positive,
-                "negative": negative
-            },
-            "sdxl": sdxl_prompt(positive, negative, aspect_ratio),
-            "comfyui": comfyui_recipe(positive, negative, aspect_ratio),
-            "midjourney": midjourney_prompt(positive, aspect_ratio),
-            "pika": pika_prompt(positive),
-            "runway": runway_prompt(positive),
-            "hints": {
-                "busy_output": "If output looks busy, cut adjectives first, then reduce style tags to 2–4 max.",
-                "face_hands_fix": "If faces or hands break: lower CFG to 5.5–6.0, increase steps to 36–40.",
-                "motion_warping": "If motion warps: simplify subject, keep it centered, reduce motion strength."
-            }
-        }
-
-        return jsonify(output)
-    
-    except Exception as e:
-        return jsonify({"error": f"Processing failed: {str(e)}"}), 500
-
+# API alias to match your Agent
 @app.route("/api/optimize", methods=["POST"])
-def api_optimize():
-    """Direct API endpoint for JSON-only optimization with minimal overhead."""
-    try:
-        data = request.get_json(force=True)
-        user_text = (data.get("idea") or "").strip()
-        user_negative = (data.get("negative") or "").strip()
-        aspect_ratio = (data.get("aspect_ratio") or "1:1").strip()
-        
-        if not user_text:
-            return jsonify({"error": "idea field is required"}), 400
-
-        # Extract lighting/color/tags from idea text if not provided separately
-        extras = {
-            "lighting": "",
-            "color_grade": "",
-            "extra_tags": "",
-        }
-
-        # Process the user input
-        found, subject_terms = extract_categories(user_text)
-        positive = build_positive(subject_terms, found, extras)
-        negative = build_negative(user_negative)
-
-        # Return exact format specified
-        output = {
-            "unified": {
-                "positive": positive,
-                "negative": negative
-            },
-            "sdxl": sdxl_prompt(positive, negative, aspect_ratio),
-            "comfyui": comfyui_recipe(positive, negative, aspect_ratio),
-            "midjourney": midjourney_prompt(positive, aspect_ratio),
-            "pika": pika_prompt(positive),
-            "runway": runway_prompt(positive),
-            "hints": {
-                "busy_output": "If output looks busy, cut adjectives first, then reduce style tags to 2–4 max.",
-                "face_hands_fix": "If faces or hands break: lower CFG to 5.5–6.0, increase steps to 36–40.",
-                "motion_warping": "If motion warps: simplify subject, keep it centered, reduce motion strength."
-            }
-        }
-
-        return jsonify(output)
-    
-    except Exception as e:
-        return jsonify({"error": f"Processing failed: {str(e)}"}), 500
+def optimize_api():
+    data = request.get_json(force=True)
+    out, code = _optimize_core(data)
+    return jsonify(out), code
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # Honor PORT if Replit/Agent sets it; fall back to 8080 or 5000
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
