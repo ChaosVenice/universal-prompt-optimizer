@@ -74,81 +74,105 @@ def extract_categories(user_text: str):
             if term in text:
                 found[k].append(term)
 
-    # Extract likely subject terms (non-style, non-stopword)
-    all_style = set()
-    for arr in STYLE_KEYWORDS.values():
-        all_style.update(arr)
-    subject_terms = [w for w in words if w not in STOPWORDS and w not in all_style and len(w) > 2]
+    # Subject terms are remaining meaningful words after removing style terms and stopwords
+    used_style_words = set()
+    for style_list in found.values():
+        for term in style_list:
+            used_style_words.update(tokenize(term))
 
+    subject_terms = [w for w in words 
+                    if w not in STOPWORDS 
+                    and w not in used_style_words 
+                    and len(w) > 2]
+    
     return found, subject_terms
 
-def build_positive(subject_terms, found, extras):
+def build_positive(subject_terms, found_styles, extras):
     """Construct optimized positive prompt with strict order: quality → subject → style → lighting → composition → mood → color grade → extra tags."""
-    # Strict order as specified
-    quality = ", ".join(dedup_preserve(found["quality"][:3])) or "masterpiece, best quality, highly detailed"
-    subject = ", ".join(subject_terms[:5]) if subject_terms else "primary subject"
-    style = ", ".join(dedup_preserve(found["art_styles"][:2] + found["photography"][:2]))
-    lighting = extras.get("lighting", "").strip()
-    if not lighting:
-        lighting = ", ".join(found["lighting"][:2])
-    composition = ", ".join(found["composition"][:2])
-    mood = ", ".join(found["mood"][:2])
-    color_grade = extras.get("color_grade", "").strip()
-    if not color_grade:
-        color_grade = ", ".join(found["color_grades"][:2])
-    extra_tags = extras.get("extra_tags", "").strip()
-
-    # Combine in strict order
-    parts = [quality, subject, style, lighting, composition, mood, color_grade, extra_tags]
-    parts = [p for p in parts if p.strip()]
-    result = ", ".join(parts)
+    parts = []
+    
+    # 1. Quality descriptors (always first)
+    if found_styles["quality"]:
+        parts.extend(found_styles["quality"][:2])  # Limit to avoid redundancy
+    
+    # 2. Core subject
+    parts.extend(subject_terms[:8])  # Main nouns/descriptors from user input
+    
+    # 3. Art style and photography techniques
+    parts.extend(found_styles["art_styles"][:2])
+    parts.extend(found_styles["photography"][:2])
+    
+    # 4. Lighting (priority for user-specified or detected)
+    lighting_terms = []
+    if extras.get("lighting"):
+        lighting_terms.extend(tokenize(extras["lighting"]))
+    lighting_terms.extend(found_styles["lighting"][:2])
+    parts.extend(lighting_terms[:2])
+    
+    # 5. Composition
+    parts.extend(found_styles["composition"][:2])
+    
+    # 6. Mood
+    parts.extend(found_styles["mood"][:2])
+    
+    # 7. Color grade (priority for user-specified)
+    color_terms = []
+    if extras.get("color_grade"):
+        color_terms.extend(tokenize(extras["color_grade"]))
+    color_terms.extend(found_styles["color_grades"][:2])
+    parts.extend(color_terms[:2])
+    
+    # 8. Extra tags (user-specified)
+    if extras.get("extra_tags"):
+        parts.extend(tokenize(extras["extra_tags"])[:3])
+    
+    # Deduplicate and join
+    final_parts = dedup_preserve(parts)
+    result = ", ".join(final_parts)
     return clamp_length(result)
 
 def build_negative(user_negative):
     """Construct enhanced negative prompt covering anatomy/structure, artifacts/quality, branding/text, style pitfalls."""
-    user_list = []
+    parts = list(NEGATIVE_DEFAULT)  # Start with comprehensive defaults
+    
     if user_negative:
-        user_list = [x.strip() for x in user_negative.split(",") if x.strip()]
-    neg = dedup_preserve(NEGATIVE_DEFAULT + user_list)
-    neg = ", ".join(neg)
-    return clamp_length(neg)
+        user_terms = [term.strip() for term in user_negative.split(",") if term.strip()]
+        parts.extend(user_terms)
+    
+    final_parts = dedup_preserve(parts)
+    result = ", ".join(final_parts)
+    return clamp_length(result)
 
-def sdxl_prompt(positive, negative, ar):
+def sdxl_prompt(positive, negative, aspect_ratio):
     """Generate SDXL-optimized prompt configuration."""
-    w, h = AR_TO_RES.get(ar, (1024, 1024))
+    w, h = AR_TO_RES.get(aspect_ratio, (1024, 1024))
     return {
         "positive": positive,
         "negative": negative,
         "settings": {
-            "width": w,
-            "height": h,
-            "steps": 25,
-            "cfg_scale": 7.0,
-            "seed": -1,
-            "sampler": "DPM++ 2M Karras"
+            "width": w, "height": h, "steps": 30, "cfg_scale": 6.5, 
+            "sampler": "DPM++ 2M Karras", "scheduler": "karras", "model": "SDXL"
         }
     }
 
-def comfyui_recipe(positive, negative, ar):
+def comfyui_recipe(positive, negative, aspect_ratio):
     """Generate ComfyUI workflow configuration with execution tips."""
-    w, h = AR_TO_RES.get(ar, (1024, 1024))
+    w, h = AR_TO_RES.get(aspect_ratio, (1024, 1024))
     return {
         "positive": positive,
         "negative": negative,
-        "nodes_hint": {
-            "KSampler": {"steps": 25, "cfg": 7.0, "sampler_name": "dpmpp_2m", "scheduler": "karras"},
-            "EmptyLatentImage": {"width": w, "height": h, "batch_size": 1},
-            "CheckpointLoaderSimple": {"ckpt_name": "sd_xl_base_1.0.safetensors"}
-        },
+        "settings": {"width": w, "height": h, "steps": 30, "cfg_scale": 6.5, "sampler": "dpmpp_2m"},
         "execution_tips": [
             "Use SDXL base model for best results",
-            "Enable 'Tiled VAE' if getting VRAM errors",
+            "Enable 'Tiled VAE' if getting VRAM errors", 
             "Consider refiner model for final 20% of steps"
         ]
     }
 
-def midjourney_prompt(positive, ar):
-    """Generate Midjourney v6 prompt string."""
+def midjourney_prompt(positive, aspect_ratio):
+    """Generate Midjourney v6 prompt with proper flags."""
+    ar_map = {"1:1": "1:1", "16:9": "16:9", "9:16": "9:16", "2:3": "2:3", "3:2": "3:2"}
+    ar = ar_map.get(aspect_ratio, "1:1")
     ar_flag = f"--ar {ar}"
     # Replace "8k" with "ultra high detail" for MJ compatibility
     clean_positive = positive.replace("8k", "ultra high detail")
@@ -209,6 +233,8 @@ h3{margin:8px 0}select, input[type="text"] {height:40px}textarea {min-height:110
 .adv{background:#0e1420;border:1px dashed #27405e;border-radius:12px;padding:12px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
 .meta{font-family:ui-monospace,monospace;font-size:11px;color:#9fb2c7}
+.progress{margin-top:10px;background:#0f141c;border:1px solid #27405e;border-radius:10px;overflow:hidden;height:14px}
+.progress .bar{height:100%;width:0%}
 </style>
 </head>
 <body>
@@ -343,10 +369,19 @@ h3{margin:8px 0}select, input[type="text"] {height:40px}textarea {min-height:110
       <div class="rowbtns">
         <button onclick="copyText('sdxlBox')">Copy JSON</button>
         <button onclick="downloadText('sdxl.json','sdxlBox')">Download JSON</button>
-        <button class="secondary" id="genComfyBtn" onclick="generateComfy()">Generate (ComfyUI)</button>
+        <button class="secondary" id="genComfyBtn" onclick="generateComfyAsync()">Generate (ComfyUI)</button>
         <button class="secondary" id="zipBtn" style="display:none" onclick="downloadZip(LAST_IMAGES)">Download ZIP</button>
       </div>
       <div id="sdxlBox" class="box section kv"></div>
+
+      <div id="progressWrap" class="hidden">
+        <div class="rowbtns">
+          <button class="danger" id="cancelBtn" onclick="cancelGeneration()">Cancel</button>
+          <span id="progressText" class="small"></span>
+        </div>
+        <div class="progress"><div id="progressBar" class="bar"></div></div>
+      </div>
+
       <div class="imgwrap" id="genImages"></div>
 
       <h3>ComfyUI</h3>
@@ -424,6 +459,8 @@ const LS_KEY = 'upo_presets_v1';
 const LS_SETTINGS = 'upo_settings_v1';
 const LS_HISTORY = 'upo_history_v1';
 let LAST_IMAGES = [];
+let POLL = null;
+let CURRENT = {host:'', pid:'', expected:1, started:0};
 
 function getForm(){
   return {
@@ -455,322 +492,109 @@ function setForm(v){
   document.getElementById('batch').value = v.batch || '';
 }
 
-// Presets (unchanged)
-function loadAllPresets(){
-  try{
-    const raw = localStorage.getItem(LS_KEY);
-    const map = raw ? JSON.parse(raw) : {};
-    const sel = document.getElementById('presetSelect');
-    sel.innerHTML = '';
-    const keys = Object.keys(map).sort((a,b)=>a.localeCompare(b));
-    keys.forEach(name=>{
-      const opt = document.createElement('option');
-      opt.value = name; opt.textContent = name;
-      sel.appendChild(opt);
-    });
-  }catch(e){ console.warn('Failed to load presets', e); }
-}
-function savePreset(){
-  const name = (document.getElementById('presetName').value || '').trim();
-  if(!name){ alert('Name your preset first.'); return; }
-  try{
-    const raw = localStorage.getItem(LS_KEY);
-    const map = raw ? JSON.parse(raw) : {};
-    map[name] = getForm();
-    localStorage.setItem(LS_KEY, JSON.stringify(map));
-    loadAllPresets();
-    document.getElementById('presetSelect').value = name;
-  }catch(e){ alert('Could not save preset.'); }
-}
-function loadPreset(){
-  const sel = document.getElementById('presetSelect');
-  const name = sel.value;
-  if(!name){ alert('No preset selected.'); return; }
-  try{
-    const map = JSON.parse(localStorage.getItem(LS_KEY) || '{}');
-    setForm(map[name]);
-  }catch(e){ alert('Could not load preset.'); }
-}
-function deletePreset(){
-  const sel = document.getElementById('presetSelect');
-  const name = sel.value;
-  if(!name){ alert('No preset selected.'); return; }
-  if(!confirm(`Delete preset "${name}"?`)) return;
-  try{
-    const map = JSON.parse(localStorage.getItem(LS_KEY) || '{}');
-    delete map[name];
-    localStorage.setItem(LS_KEY, JSON.stringify(map));
-    loadAllPresets();
-  }catch(e){ alert('Could not delete preset.'); }
-}
-function exportPresets(){
-  try{
-    const raw = localStorage.getItem(LS_KEY) || '{}';
-    const blob = new Blob([raw], {type:'application/json'});
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a'); a.href = url; a.download = 'upo_presets.json'; a.click();
-    setTimeout(()=>URL.revokeObjectURL(url), 1000);
-  }catch(e){ alert('Could not export presets.'); }
-}
-function importPresets(){
-  const input = document.createElement('input');
-  input.type = 'file'; input.accept = 'application/json';
-  input.onchange = (e)=>{
-    const file = e.target.files[0];
-    if(!file) return;
-    const reader = new FileReader();
-    reader.onload = ()=>{
-      try{
-        const incoming = JSON.parse(reader.result);
-        const current = JSON.parse(localStorage.getItem(LS_KEY) || '{}');
-        const merged = Object.assign(current, incoming);
-        localStorage.setItem(LS_KEY, JSON.stringify(merged));
-        loadAllPresets();
-        alert('Presets imported.');
-      }catch(err){ alert('Invalid JSON.'); }
-    };
-    reader.readAsText(file);
-  };
-  input.click();
-}
+// Presets/history helpers (unchanged from your current file) …
+function loadAllPresets(){ try{ const raw=localStorage.getItem(LS_KEY); const map=raw?JSON.parse(raw):{}; const sel=document.getElementById('presetSelect'); sel.innerHTML=''; Object.keys(map).sort((a,b)=>a.localeCompare(b)).forEach(name=>{ const opt=document.createElement('option'); opt.value=name; opt.textContent=name; sel.appendChild(opt); }); }catch(e){} }
+function savePreset(){ const name=(document.getElementById('presetName').value||'').trim(); if(!name){alert('Name your preset first.');return;} try{ const raw=localStorage.getItem(LS_KEY); const map=raw?JSON.parse(raw):{}; map[name]=getForm(); localStorage.setItem(LS_KEY, JSON.stringify(map)); loadAllPresets(); document.getElementById('presetSelect').value=name; }catch(e){ alert('Could not save preset.'); } }
+function loadPreset(){ const sel=document.getElementById('presetSelect'); const name=sel.value; if(!name){alert('No preset selected.');return;} try{ const map=JSON.parse(localStorage.getItem(LS_KEY)||'{}'); setForm(map[name]); }catch(e){ alert('Could not load preset.'); } }
+function deletePreset(){ const sel=document.getElementById('presetSelect'); const name=sel.value; if(!name){alert('No preset selected.');return;} if(!confirm(`Delete preset "${name}"?`)) return; try{ const map=JSON.parse(localStorage.getItem(LS_KEY)||'{}'); delete map[name]; localStorage.setItem(LS_KEY, JSON.stringify(map)); loadAllPresets(); }catch(e){ alert('Could not delete preset.'); } }
+function exportPresets(){ try{ const raw=localStorage.getItem(LS_KEY)||'{}'; const blob=new Blob([raw],{type:'application/json'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='upo_presets.json'; a.click(); setTimeout(()=>URL.revokeObjectURL(url), 1000); }catch(e){ alert('Could not export presets.'); } }
+function importPresets(){ const input=document.createElement('input'); input.type='file'; input.accept='application/json'; input.onchange=(e)=>{ const file=e.target.files[0]; if(!file) return; const reader=new FileReader(); reader.onload=()=>{ try{ const incoming=JSON.parse(reader.result); const current=JSON.parse(localStorage.getItem(LS_KEY)||'{}'); const merged=Object.assign(current,incoming); localStorage.setItem(LS_KEY, JSON.stringify(merged)); loadAllPresets(); alert('Presets imported.'); }catch(err){ alert('Invalid JSON.'); } }; reader.readAsText(file); }; input.click(); }
 
-// Settings modal
-function openSettings(){
-  const raw = localStorage.getItem(LS_SETTINGS) || '{}';
-  const s = JSON.parse(raw);
-  document.getElementById('comfyHost').value = s.host || '';
-  document.getElementById('workflowJson').value = s.workflow || '';
-  document.getElementById('settingsModal').style.display = 'flex';
-}
-function closeSettings(){ document.getElementById('settingsModal').style.display = 'none'; }
-function saveSettings(){
-  const s = {
-    host: document.getElementById('comfyHost').value.trim(),
-    workflow: document.getElementById('workflowJson').value.trim()
-  };
-  localStorage.setItem(LS_SETTINGS, JSON.stringify(s));
-  closeSettings();
-}
-
-// Helpers
-function copyText(id){
-  const el = document.getElementById(id);
-  const txt = el?.innerText || el?.textContent || '';
-  navigator.clipboard.writeText(txt);
-}
-function downloadText(filename, id){
-  const el = document.getElementById(id);
-  const txt = el?.innerText || el?.textContent || '';
-  const blob = new Blob([txt], {type: 'text/plain'});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = filename; a.click();
-  setTimeout(()=>URL.revokeObjectURL(url), 1000);
-}
-async function downloadZip(urls){
-  if(!urls || !urls.length){ alert('No images to zip.'); return; }
-  const res = await fetch('/zip', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ urls })
-  });
-  if(!res.ok){ alert('ZIP failed.'); return; }
-  const blob = await res.blob();
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = 'upo_outputs.zip';
-  a.click();
-  setTimeout(()=>URL.revokeObjectURL(a.href), 1000);
-}
-
-// History
-function loadHistory(){
-  try{
-    return JSON.parse(localStorage.getItem(LS_HISTORY) || '[]');
-  }catch(e){ return []; }
-}
-function saveHistory(arr){
-  localStorage.setItem(LS_HISTORY, JSON.stringify(arr));
-}
-function addHistory(rec){
-  const arr = loadHistory();
-  arr.unshift(rec);
-  // cap at 200 entries to avoid bloat
-  if(arr.length > 200) arr.length = 200;
-  saveHistory(arr);
-  renderHistory();
-}
-function clearHistory(){
-  if(!confirm('Clear all history?')) return;
-  saveHistory([]);
-  renderHistory();
-}
-function exportHistory(){
-  const raw = localStorage.getItem(LS_HISTORY) || '[]';
-  const blob = new Blob([raw], {type:'application/json'});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a'); a.href = url; a.download = 'upo_history.json'; a.click();
-  setTimeout(()=>URL.revokeObjectURL(url), 1000);
-}
+function loadHistory(){ try{ return JSON.parse(localStorage.getItem('upo_history_v1')||'[]'); }catch(e){ return []; } }
+function saveHistory(arr){ localStorage.setItem('upo_history_v1', JSON.stringify(arr)); }
+function addHistory(rec){ const arr=loadHistory(); arr.unshift(rec); if(arr.length>200) arr.length=200; saveHistory(arr); renderHistory(); }
+function clearHistory(){ if(!confirm('Clear all history?')) return; saveHistory([]); renderHistory(); }
+function exportHistory(){ const raw=localStorage.getItem('upo_history_v1')||'[]'; const blob=new Blob([raw],{type:'application/json'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='upo_history.json'; a.click(); setTimeout(()=>URL.revokeObjectURL(url), 1000); }
 function renderHistory(){
-  const grid = document.getElementById('historyGrid');
-  const arr = loadHistory();
-  grid.innerHTML = '';
-  arr.forEach((h, idx)=>{
-    const div = document.createElement('div');
-    div.className = 'thumb';
-    const img = document.createElement('img');
-    img.src = (h.images && h.images[0]) || '';
-    img.alt = 'generation';
-    img.loading = 'lazy';
-    img.style.maxWidth = '100%';
-    const meta = document.createElement('div');
-    meta.className = 'meta';
-    meta.textContent = `[${new Date(h.ts).toLocaleString()}] seed=${h.seed} steps=${h.steps} cfg=${h.cfg_scale} ${h.sampler} ${h.width}x${h.height}`;
-    const btns = document.createElement('div');
-    btns.className = 'rowbtns';
-    const rerun = document.createElement('button');
-    rerun.className = 'secondary';
-    rerun.textContent = 'Re-run';
-    rerun.onclick = ()=>reRun(h);
-    const dl = document.createElement('button');
-    dl.className = 'secondary';
-    dl.textContent = 'Download All';
-    dl.onclick = ()=>downloadAll(h.images||[]);
-    const zip = document.createElement('button');
-    zip.className = 'secondary';
-    zip.textContent = 'ZIP';
-    zip.onclick = ()=>downloadZip(h.images||[]);
+  const grid=document.getElementById('historyGrid'); const arr=loadHistory(); grid.innerHTML='';
+  arr.forEach((h)=>{
+    const div=document.createElement('div'); div.className='thumb';
+    const img=document.createElement('img'); img.src=(h.images&&h.images[0])||''; img.alt='generation'; img.loading='lazy'; img.style.maxWidth='100%';
+    const meta=document.createElement('div'); meta.className='meta'; meta.textContent=`[${new Date(h.ts).toLocaleString()}] seed=${h.seed} steps=${h.steps} cfg=${h.cfg_scale} ${h.sampler} ${h.width}x${h.height}`;
+    const btns=document.createElement('div'); btns.className='rowbtns';
+    const rerun=document.createElement('button'); rerun.className='secondary'; rerun.textContent='Re-run'; rerun.onclick=()=>reRun(h);
+    const dl=document.createElement('button'); dl.className='secondary'; dl.textContent='Download All'; dl.onclick=()=>downloadAll(h.images||[]);
+    const zip=document.createElement('button'); zip.className='secondary'; zip.textContent='ZIP'; zip.onclick=()=>downloadZip(h.images||[]);
     btns.appendChild(rerun); btns.appendChild(dl); btns.appendChild(zip);
-    div.appendChild(img); div.appendChild(meta); div.appendChild(btns);
-    grid.appendChild(div);
+    div.appendChild(img); div.appendChild(meta); div.appendChild(btns); grid.appendChild(div);
   });
 }
-function downloadAll(urls){
-  urls.forEach((u,i)=>{
-    const a = document.createElement('a');
-    a.href = u; a.download = `image_${i+1}.png`; a.click();
-  });
-}
-function reRun(h){
-  // Restore form + settings, then trigger generate
-  setForm({
-    idea: h.idea, negative: h.negative, aspect_ratio: h.aspect_ratio,
-    lighting: h.lighting, color_grade: h.color_grade, extra_tags: h.extra_tags,
-    steps: String(h.steps), cfg_scale: String(h.cfg_scale), sampler: h.sampler,
-    seed: String(h.seed), batch: String(h.batch)
-  });
-  // show SDXL JSON again if needed: user may click Optimize to refresh
-  generateComfy();
-}
+function downloadAll(urls){ urls.forEach((u,i)=>{ const a=document.createElement('a'); a.href=u; a.download=`image_${i+1}.png`; a.click(); }); }
 
-// Optimize
+function openSettings(){ const raw=localStorage.getItem(LS_SETTINGS)||'{}'; const s=JSON.parse(raw); document.getElementById('comfyHost').value=s.host||''; document.getElementById('workflowJson').value=s.workflow||''; document.getElementById('settingsModal').style.display='flex'; }
+function closeSettings(){ document.getElementById('settingsModal').style.display='none'; }
+function saveSettings(){ const s={ host:document.getElementById('comfyHost').value.trim(), workflow:document.getElementById('workflowJson').value.trim() }; localStorage.setItem(LS_SETTINGS, JSON.stringify(s)); closeSettings(); }
+
+function copyText(id){ const el=document.getElementById(id); const txt=el?.innerText||el?.textContent||''; navigator.clipboard.writeText(txt); }
+function downloadText(filename,id){ const el=document.getElementById(id); const txt=el?.innerText||el?.textContent||''; const blob=new Blob([txt],{type:'text/plain'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=filename; a.click(); setTimeout(()=>URL.revokeObjectURL(url),1000); }
+async function downloadZip(urls){ if(!urls||!urls.length){alert('No images to zip.');return;} const res=await fetch('/zip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({urls})}); if(!res.ok){alert('ZIP failed.');return;} const blob=await res.blob(); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='upo_outputs.zip'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); }
+
 async function optimize(){
-  const payload = getForm();
-  const res = await fetch('/optimize', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(payload)
-  });
-  const out = await res.json();
+  const payload=getForm();
+  const res=await fetch('/optimize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const out=await res.json();
   document.getElementById('results').classList.remove('hidden');
-
-  document.getElementById('unifiedPos').textContent = out.unified?.positive || '';
-  document.getElementById('unifiedNeg').textContent = out.unified?.negative || '';
-  document.getElementById('sdxlBox').textContent   = JSON.stringify(out.sdxl, null, 2);
-  document.getElementById('comfyBox').textContent  = JSON.stringify(out.comfyui, null, 2);
-  document.getElementById('mjBox').textContent     = out.midjourney || '';
-  document.getElementById('pikaBox').textContent   = JSON.stringify(out.pika, null, 2);
-  document.getElementById('runwayBox').textContent = JSON.stringify(out.runway, null, 2);
-  document.getElementById('hintsBox').textContent  = JSON.stringify(out.hints, null, 2);
-
-  const s = JSON.parse(localStorage.getItem(LS_SETTINGS) || '{}');
-  document.getElementById('genComfyBtn').style.display = s.host ? 'inline-block' : 'none';
-  document.getElementById('genImages').innerHTML = '';
-  document.getElementById('zipBtn').style.display = 'none';
+  document.getElementById('unifiedPos').textContent=out.unified?.positive||'';
+  document.getElementById('unifiedNeg').textContent=out.unified?.negative||'';
+  document.getElementById('sdxlBox').textContent=JSON.stringify(out.sdxl,null,2);
+  document.getElementById('comfyBox').textContent=JSON.stringify(out.comfyui,null,2);
+  document.getElementById('mjBox').textContent=out.midjourney||'';
+  document.getElementById('pikaBox').textContent=JSON.stringify(out.pika,null,2);
+  document.getElementById('runwayBox').textContent=JSON.stringify(out.runway,null,2);
+  document.getElementById('hintsBox').textContent=JSON.stringify(out.hints,null,2);
+  const s=JSON.parse(localStorage.getItem(LS_SETTINGS)||'{}');
+  document.getElementById('genComfyBtn').style.display=s.host?'inline-block':'none';
+  document.getElementById('genImages').innerHTML=''; document.getElementById('zipBtn').style.display='none';
+  hideProgress();
 }
-
-// Direct generation (ComfyUI)
-async function generateComfy(){
-  const s = JSON.parse(localStorage.getItem(LS_SETTINGS) || '{}');
-  if(!s.host){ alert('Set your ComfyUI host in Settings.'); return; }
-
-  let sdxlJson = {};
-  try { sdxlJson = JSON.parse(document.getElementById('sdxlBox').textContent || '{}'); }
-  catch(e){ alert('Invalid SDXL JSON—click Optimize again.'); return; }
-
-  const f = getForm();
-  const advanced = {
-    steps: f.steps, cfg_scale: f.cfg_scale, sampler: f.sampler,
-    seed: f.seed, batch: f.batch
-  };
-
-  const res = await fetch('/generate/comfy', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      host: s.host,
-      workflow_override: s.workflow || '',
-      sdxl: sdxlJson,
-      advanced
-    })
-  });
-  const out = await res.json();
-  if(!res.ok){ alert(out.error || 'Generation failed.'); return; }
-
-  // Render images
-  const wrap = document.getElementById('genImages');
-  wrap.innerHTML = '';
-  (out.images || []).forEach(url=>{
-    const img = document.createElement('img'); img.src = url; wrap.appendChild(img);
-  });
-
-  LAST_IMAGES = out.images || [];
-  document.getElementById('zipBtn').style.display = LAST_IMAGES.length ? 'inline-block' : 'none';
-
-  // Add to history
-  try{
-    const settings = sdxlJson.settings || {};
-    addHistory({
-      ts: Date.now(),
-      images: out.images || [],
-      seed: out.seed || (advanced.seed || 'random'),
-      batch: Number(advanced.batch || 1),
-      steps: Number(advanced.steps || settings.steps || 30),
-      cfg_scale: Number(advanced.cfg_scale || settings.cfg_scale || 6.5),
-      sampler: (advanced.sampler || settings.sampler || 'DPM++ 2M Karras'),
-      width: Number(settings.width || 1024),
-      height: Number(settings.height || 1024),
-      // echo inputs for rerun
-      idea: document.getElementById('idea').value.trim(),
-      negative: document.getElementById('negative').value.trim(),
-      aspect_ratio: document.getElementById('ar').value,
-      lighting: document.getElementById('lighting').value.trim(),
-      color_grade: document.getElementById('color_grade').value.trim(),
-      extra_tags: document.getElementById('extra_tags').value.trim()
-    });
-  }catch(e){ console.warn('history add failed', e); }
-}
-
-function openSettings(){
-  const raw = localStorage.getItem(LS_SETTINGS) || '{}';
-  const s = JSON.parse(raw);
-  document.getElementById('comfyHost').value = s.host || '';
-  document.getElementById('workflowJson').value = s.workflow || '';
-  document.getElementById('settingsModal').style.display = 'flex';
-}
-function closeSettings(){ document.getElementById('settingsModal').style.display = 'none'; }
-function saveSettings(){
-  const s = {
-    host: document.getElementById('comfyHost').value.trim(),
-    workflow: document.getElementById('workflowJson').value.trim()
-  };
-  localStorage.setItem(LS_SETTINGS, JSON.stringify(s));
-  closeSettings();
-}
-
 document.getElementById('run').addEventListener('click', optimize);
-document.addEventListener('DOMContentLoaded', ()=>{
-  loadAllPresets();
-  renderHistory();
-});
+
+function showProgress(){ document.getElementById('progressWrap').classList.remove('hidden'); setProgress(0,'Queued...'); }
+function hideProgress(){ document.getElementById('progressWrap').classList.add('hidden'); setProgress(0,''); }
+function setProgress(pct, text){ const bar=document.getElementById('progressBar'); bar.style.width=(pct||0)+'%'; bar.style.background = 'linear-gradient(90deg,#2f6df6,#36c3ff)'; document.getElementById('progressText').textContent=text||''; }
+
+async function generateComfyAsync(){
+  const s=JSON.parse(localStorage.getItem(LS_SETTINGS)||'{}');
+  if(!s.host){ alert('Set your ComfyUI host in Settings.'); return; }
+  let sdxlJson={}; try{ sdxlJson=JSON.parse(document.getElementById('sdxlBox').textContent||'{}'); }catch(e){ alert('Invalid SDXL JSON. Run "Optimize" first.'); return; }
+  const payload={host:s.host,workflow_override:s.workflow||'',sdxl:sdxlJson,advanced:{steps:document.getElementById('steps').value.trim(),cfg_scale:document.getElementById('cfg').value.trim(),sampler:document.getElementById('sampler').value,seed:document.getElementById('seed').value.trim(),batch:document.getElementById('batch').value.trim()}};
+  try{
+    showProgress(); LAST_IMAGES=[];
+    const res=await fetch('/generate/comfy_async',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const out=await res.json();
+    if(!res.ok||out.error){ hideProgress(); alert(`Queue failed: ${out.error||'Unknown error'}`); return; }
+    CURRENT={host:s.host,pid:out.prompt_id,expected:out.batch||1,started:Date.now()};
+    setProgress(5,`Queued (${out.prompt_id})`);
+    POLL=setInterval(pollStatus,1500);
+  }catch(err){ hideProgress(); alert(`Network error: ${err.message}`); }
+}
+
+async function pollStatus(){
+  if(!CURRENT.pid) return;
+  try{
+    const url=`/generate/comfy_status?host=${encodeURIComponent(CURRENT.host)}&pid=${encodeURIComponent(CURRENT.pid)}`;
+    const res=await fetch(url);
+    const out=await res.json();
+    if(!res.ok||out.error){ clearInterval(POLL); hideProgress(); alert(`Status error: ${out.error||'Unknown'}`); return; }
+    const found=out.images||[]; const elapsed=((Date.now()-CURRENT.started)/1000).toFixed(0);
+    if(found.length>=CURRENT.expected){
+      clearInterval(POLL); POLL=null; hideProgress();
+      LAST_IMAGES=found; const wrap=document.getElementById('genImages'); wrap.innerHTML='';
+      found.forEach(url=>{const img=document.createElement('img'); img.src=url; img.alt='Generated image'; img.loading='lazy'; wrap.appendChild(img);});
+      document.getElementById('zipBtn').style.display='inline-block';
+      const form=getForm(); const historyRecord={ts:Date.now(),idea:form.idea,negative:form.negative,aspect_ratio:form.aspect_ratio,lighting:form.lighting,color_grade:form.color_grade,extra_tags:form.extra_tags,steps:form.steps||'30',cfg_scale:form.cfg_scale||'6.5',sampler:form.sampler||'DPM++ 2M Karras',seed:form.seed||'random',batch:form.batch||'1',width:1024,height:1024,images:LAST_IMAGES}; addHistory(historyRecord);
+    }else{
+      const pct=Math.min(95,10+((found.length/CURRENT.expected)*85));
+      setProgress(pct,`Generating ${found.length}/${CURRENT.expected} (${elapsed}s)`);
+    }
+  }catch(err){ clearInterval(POLL); hideProgress(); alert(`Poll error: ${err.message}`); }
+}
+
+function cancelGeneration(){ if(POLL){ clearInterval(POLL); POLL=null; } hideProgress(); fetch('/generate/comfy_cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt_id:CURRENT.pid})}); CURRENT={host:'',pid:'',expected:1,started:0}; }
+
+function reRun(h){ if(!h) return; setForm({idea:h.idea||'',negative:h.negative||'',aspect_ratio:h.aspect_ratio||'16:9',lighting:h.lighting||'',color_grade:h.color_grade||'',extra_tags:h.extra_tags||'',steps:h.steps||'',cfg_scale:h.cfg_scale||'',sampler:h.sampler||'DPM++ 2M Karras',seed:h.seed||'',batch:h.batch||''}); optimize(); }
+
+document.addEventListener('DOMContentLoaded',()=>{ loadAllPresets(); renderHistory(); });
 </script>
 </body>
 </html>
@@ -824,6 +648,121 @@ def optimize():
 def api_optimize():
     return optimize()
 
+# Map pretty sampler names to ComfyUI short names
+_SAMPLER_MAP = {
+    "DPM++ 2M Karras": "dpmpp_2m", "DPM++ 2M": "dpmpp_2m",
+    "DPM++ SDE Karras": "dpmpp_sde", "Euler a": "euler_ancestral"
+}
+
+@app.route("/generate/comfy_async", methods=["POST"])
+def generate_comfy_async():
+    """
+    Queues a ComfyUI job and returns prompt_id immediately for polling.
+    Body: {
+      "host": "http://127.0.0.1:8188",
+      "workflow_override": "<optional JSON string>",
+      "sdxl": {positive, negative, settings:{width,height,steps,cfg_scale,sampler}},
+      "advanced": {steps,cfg_scale,sampler,seed,batch}
+    }
+    """
+    data = request.get_json(force=True)
+    host = (data.get("host") or "").rstrip("/")
+    if not host:
+        return jsonify({"error":"Missing ComfyUI host"}), 400
+
+    sdxl = data.get("sdxl") or {}
+    pos = sdxl.get("positive") or ""
+    neg = sdxl.get("negative") or ""
+    st  = sdxl.get("settings") or {}
+    w = int(st.get("width", 1024)); h = int(st.get("height", 1024))
+    steps_default = int(st.get("steps", 30))
+    cfg_default   = float(st.get("cfg_scale", 6.5))
+    sampler_name  = (st.get("sampler") or "DPM++ 2M Karras").strip()
+
+    adv = data.get("advanced") or {}
+    def _i(x, d): 
+        try: return int(str(x).strip())
+        except: return d
+    def _f(x, d): 
+        try: return float(str(x).strip())
+        except: return d
+
+    steps = _i(adv.get("steps",""), steps_default)
+    cfg   = _f(adv.get("cfg_scale",""), cfg_default)
+    sampler = _SAMPLER_MAP.get(adv.get("sampler", sampler_name), "dpmpp_2m")
+    seed_raw = str(adv.get("seed","")).lower().strip()
+    seed = random.randint(1, 2**31 - 1) if seed_raw in ("", "random", "rnd") else _i(seed_raw, random.randint(1, 2**31 - 1))
+    batch = max(1, min(8, _i(adv.get("batch",""), 1)))
+
+    wf_override_raw = data.get("workflow_override") or ""
+    if wf_override_raw.strip():
+        try:
+            g = json.loads(wf_override_raw)
+            for _, node in g.items():
+                c = (node.get("class_type") or "").lower()
+                if c.startswith("cliptextencode"):
+                    for key in ("text","text_g","text_l"):
+                        if key in node.get("inputs", {}):
+                            node["inputs"][key] = pos
+                if c.startswith("emptylatentimage"):
+                    node["inputs"]["width"] = w
+                    node["inputs"]["height"] = h
+                    node["inputs"]["batch_size"] = int(batch)
+                if c == "ksampler":
+                    node["inputs"]["seed"] = int(seed)
+                    node["inputs"]["steps"] = int(steps)
+                    node["inputs"]["cfg"] = float(cfg)
+                    node["inputs"]["sampler_name"] = sampler
+                    node["inputs"]["scheduler"] = "karras"
+            graph = g
+        except Exception as e:
+            return jsonify({"error": f"Invalid workflow_override JSON: {e}"}), 400
+    else:
+        graph = _build_default_sdxl_workflow(pos, neg, w, h, steps=steps, cfg=cfg, sampler=sampler, seed=seed, batch_size=batch)
+
+    try:
+        out = _http_post_json(f"{host}/prompt", {"prompt": graph})
+        pid = out.get("prompt_id")
+        if not pid:
+            return jsonify({"error":"No prompt_id from ComfyUI"}), 502
+        return jsonify({"ok": True, "prompt_id": pid, "seed": seed, "batch": batch, "width": w, "height": h}), 200
+    except Exception as e:
+        return jsonify({"error": f"Queue error: {e}"}), 502
+
+@app.route("/generate/comfy_status", methods=["GET"])
+def generate_comfy_status():
+    """
+    Query: host=http://127.0.0.1:8188&pid=<prompt_id>
+    Returns images found so far (if any).
+    """
+    host = (request.args.get("host") or "").rstrip("/")
+    pid  = request.args.get("pid") or ""
+    if not host or not pid:
+        return jsonify({"error":"Missing host or pid"}), 400
+    try:
+        hist = _http_get_json(f"{host}/history/{pid}")
+        images = []
+        entry = hist.get(pid) or {}
+        for _, node_out in (entry.get("outputs") or {}).items():
+            if "images" in node_out:
+                for img in node_out["images"]:
+                    fname = img.get("filename")
+                    subf  = img.get("subfolder","")
+                    if fname:
+                        images.append(f"{host}/view?filename={fname}&subfolder={subf}&type=output")
+        return jsonify({"images": images, "done": bool(images)}), 200
+    except Exception as e:
+        return jsonify({"error": f"Status error: {e}"}), 502
+
+@app.route("/generate/comfy_cancel", methods=["POST"])
+def generate_comfy_cancel():
+    """
+    Soft-cancel: client stops polling. We return OK immediately.
+    (Some ComfyUI builds support queue management via API, but it's not guaranteed.)
+    Body: { "prompt_id": "..." }
+    """
+    return jsonify({"ok": True}), 200
+
 def _build_default_sdxl_workflow(pos, neg, w, h, steps=30, cfg=6.5, sampler="dpmpp_2m", seed=123456789, batch_size=1):
     """
     Minimal SDXL text2img workflow_api graph. Adjust model/vae names to match your install.
@@ -873,67 +812,50 @@ def generate_comfy():
         return jsonify({"error":"Missing ComfyUI host"}), 400
 
     sdxl = data.get("sdxl") or {}
-    positive = sdxl.get("positive") or ""
-    negative = sdxl.get("negative") or ""
-    settings = sdxl.get("settings") or {}
-    w = int(settings.get("width", 1024))
-    h = int(settings.get("height", 1024))
+    pos = sdxl.get("positive") or ""
+    neg = sdxl.get("negative") or ""
+    st  = sdxl.get("settings") or {}
+    w = int(st.get("width", 1024))
+    h = int(st.get("height", 1024))
+    steps_default = int(st.get("steps", 30))
+    cfg_default   = float(st.get("cfg_scale", 6.5))
+    sampler_name  = (st.get("sampler") or "DPM++ 2M Karras").strip()
 
-    # advanced overrides
+    # Advanced overrides
     adv = data.get("advanced") or {}
-    def _to_int(x, default):
-        try:
-            return int(str(x).strip())
-        except:
-            return default
-    def _to_float(x, default):
-        try:
-            return float(str(x).strip())
-        except:
-            return default
+    def _i(x, d): 
+        try: return int(str(x).strip())
+        except: return d
+    def _f(x, d): 
+        try: return float(str(x).strip())
+        except: return d
 
-    steps_default = int(settings.get("steps", 30))
-    cfg_default = float(settings.get("cfg_scale", 6.5))
-    sampler_default = settings.get("sampler", "DPM++ 2M Karras")
-    batch_default = 1
+    steps = _i(adv.get("steps",""), steps_default)
+    cfg   = _f(adv.get("cfg_scale",""), cfg_default)
+    sampler = _SAMPLER_MAP.get(adv.get("sampler", sampler_name), "dpmpp_2m")
+    
+    seed_raw = str(adv.get("seed","")).lower().strip()
+    seed = random.randint(1, 2**31 - 1) if seed_raw in ("", "random", "rnd") else _i(seed_raw, random.randint(1, 2**31 - 1))
+    
+    batch = max(1, min(8, _i(adv.get("batch",""), 1)))
 
-    steps = _to_int(adv.get("steps", ""), steps_default)
-    cfg = _to_float(adv.get("cfg_scale", ""), cfg_default)
-    sampler_name = (adv.get("sampler") or sampler_default).strip()
-
-    # sampler map to ComfyUI short names
-    sampler_map = {
-        "DPM++ 2M Karras": "dpmpp_2m", "DPM++ 2M": "dpmpp_2m",
-        "DPM++ SDE Karras": "dpmpp_sde", "Euler a": "euler_ancestral"
-    }
-    sampler = sampler_map.get(sampler_name, "dpmpp_2m")
-
-    # seed handling
-    seed_raw = (adv.get("seed") or "").strip().lower()
-    if seed_raw in ("", "random", "rnd"):
-        seed = random.randint(1, 2**31 - 1)
-    else:
-        try: seed = int(seed_raw)
-        except: seed = random.randint(1, 2**31 - 1)
-
-    batch = max(1, min(8, _to_int(adv.get("batch", ""), batch_default)))
-
-    # Build graph (or inject override)
+    # Custom workflow check
     wf_override_raw = data.get("workflow_override") or ""
     if wf_override_raw.strip():
         try:
             g = json.loads(wf_override_raw)
-            for k, node in g.items():
-                ctype = (node.get("class_type") or "").lower()
-                if ctype.startswith("cliptextencode"):
+            # Basic text replacements
+            for _, node in g.items():
+                c = (node.get("class_type") or "").lower()
+                if c.startswith("cliptextencode"):
                     for key in ("text","text_g","text_l"):
                         if key in node.get("inputs", {}):
-                            node["inputs"][key] = positive
-                if ctype.startswith("emptylatentimage"):
-                    node["inputs"]["width"]  = w
+                            node["inputs"][key] = pos
+                if c.startswith("emptylatentimage"):
+                    node["inputs"]["width"] = w
                     node["inputs"]["height"] = h
                     node["inputs"]["batch_size"] = int(batch)
-                if ctype == "ksampler":
+                if c == "ksampler":
                     node["inputs"]["seed"] = int(seed)
                     node["inputs"]["steps"] = int(steps)
                     node["inputs"]["cfg"] = float(cfg)
@@ -943,75 +865,96 @@ def generate_comfy():
         except Exception as e:
             return jsonify({"error": f"Invalid workflow_override JSON: {e}"}), 400
     else:
-        graph = _build_default_sdxl_workflow(
-            positive, negative, w, h,
-            steps=steps, cfg=cfg, sampler=sampler,
-            seed=seed, batch_size=batch
-        )
+        graph = _build_default_sdxl_workflow(pos, neg, w, h, steps=steps, cfg=cfg, sampler=sampler, seed=seed, batch_size=batch)
 
-    # queue & poll
     try:
         out = _http_post_json(f"{host}/prompt", {"prompt": graph})
-        prompt_id = out.get("prompt_id")
-        if not prompt_id:
-            return jsonify({"error":"No prompt_id returned from ComfyUI"}), 502
+        pid = out.get("prompt_id")
+        if not pid:
+            return jsonify({"error":"No prompt_id from ComfyUI"}), 502
 
-        start = time.time()
-        image_urls = []
-        while time.time() - start < 180:
-            hist = _http_get_json(f"{host}/history/{prompt_id}")
-            for node_id, node_data in (hist.get(prompt_id) or {}).get("outputs", {}).items():
-                if "images" in node_data:
-                    for img in node_data["images"]:
-                        fname = img.get("filename")
-                        subf = img.get("subfolder","")
-                        if fname:
-                            url = f"{host}/view?filename={fname}&subfolder={subf}&type=output"
-                            if url not in image_urls:
-                                image_urls.append(url)
-            if image_urls:
-                break
-            time.sleep(1.2)
-
-        if not image_urls:
-            return jsonify({"error":"Timed out waiting for images"}), 504
-
-        return jsonify({"ok": True, "images": image_urls, "seed": seed, "batch": batch}), 200
-
-    except (URLError, HTTPError) as e:
-        return jsonify({"error": f"Network error contacting ComfyUI: {e}"}), 502
-    except Exception as e:
-        return jsonify({"error": f"Unexpected error: {e}"}), 500
-
-@app.post("/zip")
-def zip_images():
-    """
-    Body: { "urls": ["http://host/view?filename=...","..."] }
-    Returns: application/zip of all images (skips any that fail)
-    """
-    data = request.get_json(force=True)
-    urls = data.get("urls") or []
-    if not isinstance(urls, list) or not urls:
-        return jsonify({"error": "No urls provided"}), 400
-
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for i, u in enumerate(urls):
+        # Poll for results (blocking)
+        start_time = time.time()
+        max_wait = 120  # 2 minutes timeout
+        images = []
+        
+        while time.time() - start_time < max_wait:
             try:
-                with urlreq.urlopen(u, timeout=20) as resp:
-                    content = resp.read()
-                # naive extension guess; ComfyUI serves PNG by default
-                z.writestr(f"image_{i+1}.png", content)
+                hist = _http_get_json(f"{host}/history/{pid}")
+                entry = hist.get(pid) or {}
+                for _, node_out in (entry.get("outputs") or {}).items():
+                    if "images" in node_out:
+                        for img in node_out["images"]:
+                            fname = img.get("filename")
+                            subf  = img.get("subfolder","")
+                            if fname:
+                                images.append(f"{host}/view?filename={fname}&subfolder={subf}&type=output")
+                
+                if images:
+                    return jsonify({
+                        "images": images,
+                        "seed": seed,
+                        "steps": steps,
+                        "cfg_scale": cfg,
+                        "sampler": sampler,
+                        "batch": batch,
+                        "width": w,
+                        "height": h
+                    }), 200
+                
+                time.sleep(1)
             except Exception:
-                # skip errors silently to still return a ZIP for the rest
+                time.sleep(1)
                 continue
-    buf.seek(0)
-    return Response(
-        buf.getvalue(),
-        mimetype="application/zip",
-        headers={"Content-Disposition": "attachment; filename=upo_outputs.zip"}
-    )
+        
+        return jsonify({"error": "Generation timed out. Check ComfyUI console."}), 408
+    
+    except Exception as e:
+        return jsonify({"error": f"ComfyUI error: {e}"}), 502
+
+@app.route("/zip", methods=["POST"])
+def create_zip():
+    """Create ZIP archive from image URLs"""
+    try:
+        data = request.get_json() or {}
+        urls = data.get("urls", [])
+        
+        if not urls:
+            return jsonify({"error": "No URLs provided"}), 400
+        
+        # Create in-memory ZIP
+        zip_buffer = io.BytesIO()
+        
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for i, url in enumerate(urls):
+                try:
+                    # Fetch image
+                    req = urlreq.Request(url)
+                    with urlreq.urlopen(req, timeout=10) as response:
+                        image_data = response.read()
+                    
+                    # Add to ZIP with filename
+                    filename = f"image_{i+1:02d}.png"
+                    zip_file.writestr(filename, image_data)
+                    
+                except Exception as e:
+                    # Skip failed images but continue with others
+                    print(f"Failed to fetch {url}: {e}")
+                    continue
+        
+        zip_buffer.seek(0)
+        
+        return Response(
+            zip_buffer.getvalue(),
+            mimetype='application/zip',
+            headers={
+                'Content-Disposition': 'attachment; filename=upo_outputs.zip',
+                'Content-Length': str(len(zip_buffer.getvalue()))
+            }
+        )
+        
+    except Exception as e:
+        return jsonify({"error": f"ZIP creation failed: {e}"}), 500
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True)

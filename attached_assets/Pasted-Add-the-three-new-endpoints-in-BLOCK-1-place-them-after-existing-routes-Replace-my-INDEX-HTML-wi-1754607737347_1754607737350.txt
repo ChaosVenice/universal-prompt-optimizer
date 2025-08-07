@@ -1,0 +1,583 @@
+Add the three new endpoints in BLOCK 1 (place them after existing routes).
+
+Replace my INDEX_HTML with BLOCK 2.
+Do not delete any existing endpoints. Restart when done.
+
+BLOCK 1 — New async endpoints (queue → poll → cancel)
+python
+Copy
+Edit
+# --- add with other imports if missing ---
+import time, json, random
+from urllib import request as urlreq
+from urllib.error import URLError, HTTPError
+from flask import request, jsonify
+
+def _http_post_json(url, payload):
+    data = json.dumps(payload).encode("utf-8")
+    req = urlreq.Request(url, data=data, headers={"Content-Type":"application/json"})
+    with urlreq.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+def _http_get_json(url):
+    with urlreq.urlopen(url, timeout=15) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+# Helper reused from before (ensure it exists in your file)
+def _build_default_sdxl_workflow(pos, neg, w, h, steps=30, cfg=6.5, sampler="dpmpp_2m", seed=123456789, batch_size=1):
+    return {
+      "3": {"class_type": "KSampler", "inputs": {
+        "seed": int(seed), "steps": int(steps), "cfg": float(cfg),
+        "sampler_name": sampler, "scheduler": "karras", "denoise": 1.0,
+        "model": ["21", 0], "positive": ["12", 0], "negative": ["13", 0], "latent_image": ["5", 0]
+      }},
+      "5": {"class_type": "EmptyLatentImage", "inputs": {"width": int(w), "height": int(h), "batch_size": int(batch_size)}},
+      "7": {"class_type": "VAEDecode", "inputs": {"samples": ["3", 0], "vae": ["22", 0]}},
+      "8": {"class_type": "SaveImage", "inputs": {"images": ["7", 0]}},
+      "12": {"class_type": "CLIPTextEncodeSDXL", "inputs": {"text_g": pos, "text_l": pos, "clip": ["20", 0]}},
+      "13": {"class_type": "CLIPTextEncodeSDXL", "inputs": {"text_g": neg, "text_l": neg, "clip": ["20", 0]}},
+      "20": {"class_type": "CLIPSetLastLayer", "inputs": {"stop_at_clip_layer": -1, "clip": ["19", 0]}},
+      "21": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
+      "22": {"class_type": "VAELoader", "inputs": {"vae_name": "sdxl_vae.safetensors"}},
+      "19": {"class_type": "CLIPLoader", "inputs": {"clip_name": "sdxl_clip.safetensors"}}
+    }
+
+# Map pretty sampler names to ComfyUI short names
+_SAMPLER_MAP = {
+    "DPM++ 2M Karras": "dpmpp_2m", "DPM++ 2M": "dpmpp_2m",
+    "DPM++ SDE Karras": "dpmpp_sde", "Euler a": "euler_ancestral"
+}
+
+@app.post("/generate/comfy_async")
+def generate_comfy_async():
+    """
+    Queues a ComfyUI job and returns prompt_id immediately for polling.
+    Body: {
+      "host": "http://127.0.0.1:8188",
+      "workflow_override": "<optional JSON string>",
+      "sdxl": {positive, negative, settings:{width,height,steps,cfg_scale,sampler}},
+      "advanced": {steps,cfg_scale,sampler,seed,batch}
+    }
+    """
+    data = request.get_json(force=True)
+    host = (data.get("host") or "").rstrip("/")
+    if not host:
+        return jsonify({"error":"Missing ComfyUI host"}), 400
+
+    sdxl = data.get("sdxl") or {}
+    pos = sdxl.get("positive") or ""
+    neg = sdxl.get("negative") or ""
+    st  = sdxl.get("settings") or {}
+    w = int(st.get("width", 1024)); h = int(st.get("height", 1024))
+    steps_default = int(st.get("steps", 30))
+    cfg_default   = float(st.get("cfg_scale", 6.5))
+    sampler_name  = (st.get("sampler") or "DPM++ 2M Karras").strip()
+
+    adv = data.get("advanced") or {}
+    def _i(x, d): 
+        try: return int(str(x).strip())
+        except: return d
+    def _f(x, d): 
+        try: return float(str(x).strip())
+        except: return d
+
+    steps = _i(adv.get("steps",""), steps_default)
+    cfg   = _f(adv.get("cfg_scale",""), cfg_default)
+    sampler = _SAMPLER_MAP.get(adv.get("sampler", sampler_name), "dpmpp_2m")
+    seed_raw = str(adv.get("seed","")).lower().strip()
+    seed = random.randint(1, 2**31 - 1) if seed_raw in ("", "random", "rnd") else _i(seed_raw, random.randint(1, 2**31 - 1))
+    batch = max(1, min(8, _i(adv.get("batch",""), 1)))
+
+    wf_override_raw = data.get("workflow_override") or ""
+    if wf_override_raw.strip():
+        try:
+            g = json.loads(wf_override_raw)
+            for _, node in g.items():
+                c = (node.get("class_type") or "").lower()
+                if c.startswith("cliptextencode"):
+                    for key in ("text","text_g","text_l"):
+                        if key in node.get("inputs", {}):
+                            node["inputs"][key] = pos
+                if c.startswith("emptylatentimage"):
+                    node["inputs"]["width"] = w
+                    node["inputs"]["height"] = h
+                    node["inputs"]["batch_size"] = int(batch)
+                if c == "ksampler":
+                    node["inputs"]["seed"] = int(seed)
+                    node["inputs"]["steps"] = int(steps)
+                    node["inputs"]["cfg"] = float(cfg)
+                    node["inputs"]["sampler_name"] = sampler
+                    node["inputs"]["scheduler"] = "karras"
+            graph = g
+        except Exception as e:
+            return jsonify({"error": f"Invalid workflow_override JSON: {e}"}), 400
+    else:
+        graph = _build_default_sdxl_workflow(pos, neg, w, h, steps=steps, cfg=cfg, sampler=sampler, seed=seed, batch_size=batch)
+
+    try:
+        out = _http_post_json(f"{host}/prompt", {"prompt": graph})
+        pid = out.get("prompt_id")
+        if not pid:
+            return jsonify({"error":"No prompt_id from ComfyUI"}), 502
+        return jsonify({"ok": True, "prompt_id": pid, "seed": seed, "batch": batch, "width": w, "height": h}), 200
+    except Exception as e:
+        return jsonify({"error": f"Queue error: {e}"}), 502
+
+@app.get("/generate/comfy_status")
+def generate_comfy_status():
+    """
+    Query: host=http://127.0.0.1:8188&pid=<prompt_id>
+    Returns images found so far (if any).
+    """
+    host = (request.args.get("host") or "").rstrip("/")
+    pid  = request.args.get("pid") or ""
+    if not host or not pid:
+        return jsonify({"error":"Missing host or pid"}), 400
+    try:
+        hist = _http_get_json(f"{host}/history/{pid}")
+        images = []
+        entry = hist.get(pid) or {}
+        for _, node_out in (entry.get("outputs") or {}).items():
+            if "images" in node_out:
+                for img in node_out["images"]:
+                    fname = img.get("filename")
+                    subf  = img.get("subfolder","")
+                    if fname:
+                        images.append(f"{host}/view?filename={fname}&subfolder={subf}&type=output")
+        return jsonify({"images": images, "done": bool(images)}), 200
+    except Exception as e:
+        return jsonify({"error": f"Status error: {e}"}), 502
+
+@app.post("/generate/comfy_cancel")
+def generate_comfy_cancel():
+    """
+    Soft-cancel: client stops polling. We return OK immediately.
+    (Some ComfyUI builds support queue management via API, but it’s not guaranteed.)
+    Body: { "prompt_id": "..." }
+    """
+    return jsonify({"ok": True}), 200
+BLOCK 2 — Replace INDEX_HTML (adds progress bar + Cancel, switches to async flow)
+python
+Copy
+Edit
+INDEX_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Universal Prompt Optimizer</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#0b0f14;color:#e7edf5}
+.container{max-width:980px;margin:36px auto;padding:0 16px}
+.card{background:#111826;border:1px solid #1f2a3a;border-radius:14px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.25);margin-bottom:16px}
+h1{margin:0 0 6px;font-size:28px}.sub{margin:0 0 18px;color:#9fb2c7}
+label{display:block;font-size:14px;color:#a9bdd4;margin-bottom:6px}
+textarea,input,select{width:100%;padding:10px 12px;border-radius:10px;border:1px solid #243447;background:#0f141c;color:#e7edf5}
+textarea::placeholder,input::placeholder{color:#627a91}.row{display:flex;gap:12px;margin-top:12px;flex-wrap:wrap}.col{flex:1;min-width:240px}
+button{margin-top:10px;padding:10px 14px;background:#2f6df6;border:none;border-radius:10px;color:#fff;font-weight:600;cursor:pointer}
+button.secondary{background:#1e293b}button.danger{background:#9b1c1c}
+button:hover{filter:brightness(1.05)}.results{margin-top:22px}.hidden{display:none}
+.box{background:#0f141c;border:1px solid #1f2a3a;padding:12px;border-radius:10px;white-space:pre-wrap}
+.section{margin-top:14px}.rowbtns{display:flex;gap:8px;flex-wrap:wrap}
+.kv{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;color:#bcd0e3}
+small,.small{font-size:12px;color:#7f93a7}.badge{display:inline-block;padding:4px 8px;border:1px solid #2d3b4e;border-radius:999px;margin-right:6px;color:#a9bdd4}
+footer{margin-top:24px;text-align:center;color:#6f859c;font-size:12px}
+h3{margin:8px 0}select, input[type="text"] {height:40px}textarea {min-height:110px}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;padding:16px}
+.modal .inner{background:#0f141c;border:1px solid #223045;border-radius:14px;max-width:720px;width:100%;padding:16px}
+.modal .actions{display:flex;gap:10px;justify-content:flex-end;margin-top:10px}
+.imgwrap{margin-top:10px;display:flex;gap:12px;flex-wrap:wrap}
+.imgwrap img{max-width:320px;border-radius:10px;border:1px solid #1f2a3a}
+.thumb{display:flex;flex-direction:column;gap:6px}
+.adv{background:#0e1420;border:1px dashed #27405e;border-radius:12px;padding:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
+.meta{font-family:ui-monospace,monospace;font-size:11px;color:#9fb2c7}
+.progress{margin-top:10px;background:#0f141c;border:1px solid #27405e;border-radius:10px;overflow:hidden;height:14px}
+.progress .bar{height:100%;width:0%}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Universal Prompt Optimizer</h1>
+  <p class="sub">Turn rough ideas into model-ready prompts for SDXL, ComfyUI, Midjourney, Pika, and Runway. Built for speed + consistency.</p>
+
+  <!-- INPUTS -->
+  <div class="card">
+    <div class="row">
+      <div class="col">
+        <label>Your idea</label>
+        <textarea id="idea" placeholder="e.g., A cozy coffee shop at golden hour, rain outside, cinematic lighting, moody vibe, shallow depth of field, candid couple"></textarea>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="col">
+        <label>Negative prompt (optional)</label>
+        <input id="negative" placeholder="e.g., lowres, watermark, bad anatomy">
+      </div>
+      <div class="col">
+        <label>Aspect ratio</label>
+        <select id="ar">
+          <option selected>16:9</option>
+          <option>1:1</option>
+          <option>9:16</option>
+          <option>2:3</option>
+          <option>3:2</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="col">
+        <label>Lighting (optional)</label>
+        <input id="lighting" placeholder="e.g., soft studio lighting, volumetric light">
+      </div>
+      <div class="col">
+        <label>Color grade (optional)</label>
+        <input id="color_grade" placeholder="e.g., teal and orange, Kodak Portra 400, moody grade">
+      </div>
+      <div class="col">
+        <label>Extra tags (optional)</label>
+        <input id="extra_tags" placeholder="e.g., film grain, depth of field, subsurface scattering">
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="col small">
+        <span class="badge">Tip</span> Keep nouns concrete. Add one clear mood + one lighting cue for best control.
+      </div>
+    </div>
+
+    <!-- ADVANCED CONTROLS -->
+    <div class="adv" style="margin-top:10px">
+      <h3 style="margin-top:0">Advanced (Optional)</h3>
+      <div class="row">
+        <div class="col">
+          <label>Steps</label>
+          <input id="steps" type="text" placeholder="30">
+        </div>
+        <div class="col">
+          <label>CFG Scale</label>
+          <input id="cfg" type="text" placeholder="6.5">
+        </div>
+        <div class="col">
+          <label>Sampler</label>
+          <select id="sampler">
+            <option selected>DPM++ 2M Karras</option>
+            <option>DPM++ SDE Karras</option>
+            <option>Euler a</option>
+          </select>
+        </div>
+      </div>
+      <div class="row">
+        <div class="col">
+          <label>Seed (leave blank or type "random")</label>
+          <input id="seed" type="text" placeholder="random">
+        </div>
+        <div class="col">
+          <label>Batch size (1–8)</label>
+          <input id="batch" type="text" placeholder="1">
+        </div>
+      </div>
+      <small>Advanced values override defaults during generation. Leave blank to use optimizer defaults.</small>
+    </div>
+
+    <div class="rowbtns" style="margin-top:10px">
+      <button id="run">Optimize</button>
+      <button class="secondary" onclick="openSettings()">Settings</button>
+    </div>
+  </div>
+
+  <!-- PRESETS -->
+  <div class="card">
+    <h3>Presets</h3>
+    <div class="row">
+      <div class="col">
+        <label>Preset name</label>
+        <input id="presetName" placeholder="e.g., Neon Alley Cinematic">
+      </div>
+      <div class="col">
+        <label>Load preset</label>
+        <select id="presetSelect"></select>
+      </div>
+    </div>
+    <div class="rowbtns" style="margin-top:10px">
+      <button class="secondary" onclick="savePreset()">Save Preset</button>
+      <button class="secondary" onclick="loadPreset()">Load</button>
+      <button class="danger" onclick="deletePreset()">Delete</button>
+      <button class="secondary" onclick="exportPresets()">Export JSON</button>
+      <button class="secondary" onclick="importPresets()">Import JSON</button>
+    </div>
+    <small>Presets store: idea, negatives, AR, lighting, color grade, extra tags, and advanced settings (steps, cfg, sampler, seed, batch).</small>
+  </div>
+
+  <!-- RESULTS -->
+  <div id="results" class="results hidden">
+    <div class="card">
+      <h3>Unified Prompt</h3>
+      <div class="rowbtns">
+        <button onclick="copyText('unifiedPos')">Copy Positive</button>
+        <button onclick="copyText('unifiedNeg')">Copy Negative</button>
+        <button onclick="downloadText('unified_positive.txt','unifiedPos')">Download .txt (Positive)</button>
+        <button onclick="downloadText('unified_negative.txt','unifiedNeg')">Download .txt (Negative)</button>
+      </div>
+      <div id="unifiedPos" class="box section"></div>
+      <div id="unifiedNeg" class="box section"></div>
+
+      <h3>SDXL</h3>
+      <div class="rowbtns">
+        <button onclick="copyText('sdxlBox')">Copy JSON</button>
+        <button onclick="downloadText('sdxl.json','sdxlBox')">Download JSON</button>
+        <button class="secondary" id="genComfyBtn" onclick="generateComfyAsync()">Generate (ComfyUI)</button>
+        <button class="secondary" id="zipBtn" style="display:none" onclick="downloadZip(LAST_IMAGES)">Download ZIP</button>
+      </div>
+      <div id="sdxlBox" class="box section kv"></div>
+
+      <div id="progressWrap" class="hidden">
+        <div class="rowbtns">
+          <button class="danger" id="cancelBtn" onclick="cancelGeneration()">Cancel</button>
+          <span id="progressText" class="small"></span>
+        </div>
+        <div class="progress"><div id="progressBar" class="bar"></div></div>
+      </div>
+
+      <div class="imgwrap" id="genImages"></div>
+
+      <h3>ComfyUI</h3>
+      <div class="rowbtns">
+        <button onclick="copyText('comfyBox')">Copy JSON</button>
+        <button onclick="downloadText('comfyui.json','comfyBox')">Download JSON</button>
+      </div>
+      <div id="comfyBox" class="box section kv"></div>
+
+      <h3>Midjourney</h3>
+      <div class="rowbtns">
+        <button onclick="copyText('mjBox')">Copy Prompt</button>
+        <button onclick="downloadText('midjourney.txt','mjBox')">Download .txt</button>
+      </div>
+      <div id="mjBox" class="box section kv"></div>
+
+      <h3>Pika</h3>
+      <div class="rowbtns">
+        <button onclick="copyText('pikaBox')">Copy JSON</button>
+        <button onclick="downloadText('pika.json','pikaBox')">Download JSON</button>
+      </div>
+      <div id="pikaBox" class="box section kv"></div>
+
+      <h3>Runway</h3>
+      <div class="rowbtns">
+        <button onclick="copyText('runwayBox')">Copy JSON</button>
+        <button onclick="downloadText('runway.json','runwayBox')">Download JSON</button>
+      </div>
+      <div id="runwayBox" class="box section kv"></div>
+
+      <h3>Hints</h3>
+      <div id="hintsBox" class="box section small"></div>
+    </div>
+  </div>
+
+  <!-- HISTORY -->
+  <div class="card">
+    <h3>History</h3>
+    <div class="rowbtns">
+      <button class="secondary" onclick="exportHistory()">Export History JSON</button>
+      <button class="danger" onclick="clearHistory()">Clear History</button>
+    </div>
+    <div id="historyGrid" class="grid" style="margin-top:10px"></div>
+    <small class="small">History is saved locally in your browser (upo_history_v1). Click “Re-run” to regenerate with the same seed and settings.</small>
+  </div>
+
+  <footer>Seed tip: lock a seed for reproducibility; vary only seed to explore variants without wrecking the look.</footer>
+</div>
+
+<!-- SETTINGS MODAL -->
+<div class="modal" id="settingsModal">
+  <div class="inner">
+    <h3>ComfyUI Settings</h3>
+    <div class="row">
+      <div class="col">
+        <label>ComfyUI Host (e.g., http://127.0.0.1:8188)</label>
+        <input id="comfyHost" placeholder="http://127.0.0.1:8188">
+      </div>
+    </div>
+    <div class="row">
+      <div class="col">
+        <label>Custom Workflow JSON (optional)</label>
+        <textarea id="workflowJson" placeholder='Paste a ComfyUI "workflow_api" JSON here to override defaults'></textarea>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="secondary" onclick="closeSettings()">Close</button>
+      <button onclick="saveSettings()">Save</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const LS_KEY = 'upo_presets_v1';
+const LS_SETTINGS = 'upo_settings_v1';
+const LS_HISTORY = 'upo_history_v1';
+let LAST_IMAGES = [];
+let POLL = null;
+let CURRENT = {host:'', pid:'', expected:1, started:0};
+
+function getForm(){
+  return {
+    idea: document.getElementById('idea').value.trim(),
+    negative: document.getElementById('negative').value.trim(),
+    aspect_ratio: document.getElementById('ar').value,
+    lighting: document.getElementById('lighting').value.trim(),
+    color_grade: document.getElementById('color_grade').value.trim(),
+    extra_tags: document.getElementById('extra_tags').value.trim(),
+    steps: document.getElementById('steps').value.trim(),
+    cfg_scale: document.getElementById('cfg').value.trim(),
+    sampler: document.getElementById('sampler').value,
+    seed: document.getElementById('seed').value.trim(),
+    batch: document.getElementById('batch').value.trim()
+  };
+}
+function setForm(v){
+  if(!v) return;
+  document.getElementById('idea').value = v.idea || '';
+  document.getElementById('negative').value = v.negative || '';
+  document.getElementById('ar').value = v.aspect_ratio || '16:9';
+  document.getElementById('lighting').value = v.lighting || '';
+  document.getElementById('color_grade').value = v.color_grade || '';
+  document.getElementById('extra_tags').value = v.extra_tags || '';
+  document.getElementById('steps').value = v.steps || '';
+  document.getElementById('cfg').value = v.cfg_scale || '';
+  document.getElementById('sampler').value = v.sampler || 'DPM++ 2M Karras';
+  document.getElementById('seed').value = v.seed || '';
+  document.getElementById('batch').value = v.batch || '';
+}
+
+// Presets/history helpers (unchanged from your current file) …
+function loadAllPresets(){ try{ const raw=localStorage.getItem(LS_KEY); const map=raw?JSON.parse(raw):{}; const sel=document.getElementById('presetSelect'); sel.innerHTML=''; Object.keys(map).sort((a,b)=>a.localeCompare(b)).forEach(name=>{ const opt=document.createElement('option'); opt.value=name; opt.textContent=name; sel.appendChild(opt); }); }catch(e){} }
+function savePreset(){ const name=(document.getElementById('presetName').value||'').trim(); if(!name){alert('Name your preset first.');return;} try{ const raw=localStorage.getItem(LS_KEY); const map=raw?JSON.parse(raw):{}; map[name]=getForm(); localStorage.setItem(LS_KEY, JSON.stringify(map)); loadAllPresets(); document.getElementById('presetSelect').value=name; }catch(e){ alert('Could not save preset.'); } }
+function loadPreset(){ const sel=document.getElementById('presetSelect'); const name=sel.value; if(!name){alert('No preset selected.');return;} try{ const map=JSON.parse(localStorage.getItem(LS_KEY)||'{}'); setForm(map[name]); }catch(e){ alert('Could not load preset.'); } }
+function deletePreset(){ const sel=document.getElementById('presetSelect'); const name=sel.value; if(!name){alert('No preset selected.');return;} if(!confirm(`Delete preset "${name}"?`)) return; try{ const map=JSON.parse(localStorage.getItem(LS_KEY)||'{}'); delete map[name]; localStorage.setItem(LS_KEY, JSON.stringify(map)); loadAllPresets(); }catch(e){ alert('Could not delete preset.'); } }
+function exportPresets(){ try{ const raw=localStorage.getItem(LS_KEY)||'{}'; const blob=new Blob([raw],{type:'application/json'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='upo_presets.json'; a.click(); setTimeout(()=>URL.revokeObjectURL(url), 1000); }catch(e){ alert('Could not export presets.'); } }
+function importPresets(){ const input=document.createElement('input'); input.type='file'; input.accept='application/json'; input.onchange=(e)=>{ const file=e.target.files[0]; if(!file) return; const reader=new FileReader(); reader.onload=()=>{ try{ const incoming=JSON.parse(reader.result); const current=JSON.parse(localStorage.getItem(LS_KEY)||'{}'); const merged=Object.assign(current,incoming); localStorage.setItem(LS_KEY, JSON.stringify(merged)); loadAllPresets(); alert('Presets imported.'); }catch(err){ alert('Invalid JSON.'); } }; reader.readAsText(file); }; input.click(); }
+
+function loadHistory(){ try{ return JSON.parse(localStorage.getItem('upo_history_v1')||'[]'); }catch(e){ return []; } }
+function saveHistory(arr){ localStorage.setItem('upo_history_v1', JSON.stringify(arr)); }
+function addHistory(rec){ const arr=loadHistory(); arr.unshift(rec); if(arr.length>200) arr.length=200; saveHistory(arr); renderHistory(); }
+function clearHistory(){ if(!confirm('Clear all history?')) return; saveHistory([]); renderHistory(); }
+function exportHistory(){ const raw=localStorage.getItem('upo_history_v1')||'[]'; const blob=new Blob([raw],{type:'application/json'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='upo_history.json'; a.click(); setTimeout(()=>URL.revokeObjectURL(url), 1000); }
+function renderHistory(){
+  const grid=document.getElementById('historyGrid'); const arr=loadHistory(); grid.innerHTML='';
+  arr.forEach((h)=>{
+    const div=document.createElement('div'); div.className='thumb';
+    const img=document.createElement('img'); img.src=(h.images&&h.images[0])||''; img.alt='generation'; img.loading='lazy'; img.style.maxWidth='100%';
+    const meta=document.createElement('div'); meta.className='meta'; meta.textContent=`[${new Date(h.ts).toLocaleString()}] seed=${h.seed} steps=${h.steps} cfg=${h.cfg_scale} ${h.sampler} ${h.width}x${h.height}`;
+    const btns=document.createElement('div'); btns.className='rowbtns';
+    const rerun=document.createElement('button'); rerun.className='secondary'; rerun.textContent='Re-run'; rerun.onclick=()=>reRun(h);
+    const dl=document.createElement('button'); dl.className='secondary'; dl.textContent='Download All'; dl.onclick=()=>downloadAll(h.images||[]);
+    const zip=document.createElement('button'); zip.className='secondary'; zip.textContent='ZIP'; zip.onclick=()=>downloadZip(h.images||[]);
+    btns.appendChild(rerun); btns.appendChild(dl); btns.appendChild(zip);
+    div.appendChild(img); div.appendChild(meta); div.appendChild(btns); grid.appendChild(div);
+  });
+}
+function downloadAll(urls){ urls.forEach((u,i)=>{ const a=document.createElement('a'); a.href=u; a.download=`image_${i+1}.png`; a.click(); }); }
+
+function openSettings(){ const raw=localStorage.getItem(LS_SETTINGS)||'{}'; const s=JSON.parse(raw); document.getElementById('comfyHost').value=s.host||''; document.getElementById('workflowJson').value=s.workflow||''; document.getElementById('settingsModal').style.display='flex'; }
+function closeSettings(){ document.getElementById('settingsModal').style.display='none'; }
+function saveSettings(){ const s={ host:document.getElementById('comfyHost').value.trim(), workflow:document.getElementById('workflowJson').value.trim() }; localStorage.setItem(LS_SETTINGS, JSON.stringify(s)); closeSettings(); }
+
+function copyText(id){ const el=document.getElementById(id); const txt=el?.innerText||el?.textContent||''; navigator.clipboard.writeText(txt); }
+function downloadText(filename,id){ const el=document.getElementById(id); const txt=el?.innerText||el?.textContent||''; const blob=new Blob([txt],{type:'text/plain'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=filename; a.click(); setTimeout(()=>URL.revokeObjectURL(url),1000); }
+async function downloadZip(urls){ if(!urls||!urls.length){alert('No images to zip.');return;} const res=await fetch('/zip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({urls})}); if(!res.ok){alert('ZIP failed.');return;} const blob=await res.blob(); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='upo_outputs.zip'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); }
+
+async function optimize(){
+  const payload=getForm();
+  const res=await fetch('/optimize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const out=await res.json();
+  document.getElementById('results').classList.remove('hidden');
+  document.getElementById('unifiedPos').textContent=out.unified?.positive||'';
+  document.getElementById('unifiedNeg').textContent=out.unified?.negative||'';
+  document.getElementById('sdxlBox').textContent=JSON.stringify(out.sdxl,null,2);
+  document.getElementById('comfyBox').textContent=JSON.stringify(out.comfyui,null,2);
+  document.getElementById('mjBox').textContent=out.midjourney||'';
+  document.getElementById('pikaBox').textContent=JSON.stringify(out.pika,null,2);
+  document.getElementById('runwayBox').textContent=JSON.stringify(out.runway,null,2);
+  document.getElementById('hintsBox').textContent=JSON.stringify(out.hints,null,2);
+  const s=JSON.parse(localStorage.getItem(LS_SETTINGS)||'{}');
+  document.getElementById('genComfyBtn').style.display=s.host?'inline-block':'none';
+  document.getElementById('genImages').innerHTML=''; document.getElementById('zipBtn').style.display='none';
+  hideProgress();
+}
+document.getElementById('run').addEventListener('click', optimize);
+
+function showProgress(){ document.getElementById('progressWrap').classList.remove('hidden'); setProgress(0,'Queued...'); }
+function hideProgress(){ document.getElementById('progressWrap').classList.add('hidden'); setProgress(0,''); }
+function setProgress(pct, text){ const bar=document.getElementById('progressBar'); bar.style.width=(pct||0)+'%'; bar.style.background = 'linear-gradient(90deg,#2f6df6,#36c3ff)'; document.getElementById('progressText').textContent=text||''; }
+
+async function generateComfyAsync(){
+  const s=JSON.parse(localStorage.getItem(LS_SETTINGS)||'{}');
+  if(!s.host){ alert('Set your ComfyUI host in Settings.'); return; }
+  let sdxlJson={}; try{ sdxlJson=JSON.parse(document.getElementById('sdxlBox').textContent||'{}'); }catch(e){ alert('Invalid SDXL JSON—click Optimize again.'); return; }
+  const f=getForm();
+  const advanced={ steps:f.steps, cfg_scale:f.cfg_scale, sampler:f.sampler, seed:f.seed, batch:f.batch };
+
+  // queue job
+  const q=await fetch('/generate/comfy_async',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ host:s.host, workflow_override:s.workflow||'', sdxl:sdxlJson, advanced })});
+  const qo=await q.json();
+  if(!q.ok){ alert(qo.error||'Queue failed.'); return; }
+
+  CURRENT={ host:s.host, pid:qo.prompt_id, expected:Number(qo.batch||1), started:Date.now() };
+  showProgress(); document.getElementById('genImages').innerHTML=''; LAST_IMAGES=[];
+
+  // poll
+  let found=0;
+  if(POLL) clearInterval(POLL);
+  POLL=setInterval(async ()=>{
+    const u=`/generate/comfy_status?host=${encodeURIComponent(CURRENT.host)}&pid=${encodeURIComponent(CURRENT.pid)}`;
+    try{
+      const r=await fetch(u); const o=await r.json();
+      const imgs=o.images||[];
+      found=imgs.length;
+      const pct=Math.min(100, Math.floor((found/CURRENT.expected)*100));
+      setProgress(pct, `Generating ${found}/${CURRENT.expected}...`);
+      if(found>0){
+        const wrap=document.getElementById('genImages'); wrap.innerHTML='';
+        imgs.forEach(url=>{ const img=document.createElement('img'); img.src=url; wrap.appendChild(img); });
+        LAST_IMAGES=imgs;
+        document.getElementById('zipBtn').style.display = LAST_IMAGES.length ? 'inline-block' : 'none';
+      }
+      if(found>=CURRENT.expected){ // done
+        clearInterval(POLL); POLL=null; setProgress(100,'Done');
+        // Add to history
+        const settings=sdxlJson.settings||{};
+        addHistory({
+          ts: Date.now(), images: LAST_IMAGES, seed: qo.seed, batch: CURRENT.expected,
+          steps: Number(advanced.steps||settings.steps||30), cfg_scale:Number(advanced.cfg_scale||settings.cfg_scale||6.5),
+          sampler: (advanced.sampler||settings.sampler||'DPM++ 2M Karras'),
+          width: Number(qo.width||settings.width||1024), height: Number(qo.height||settings.height||1024),
+          idea: document.getElementById('idea').value.trim(), negative: document.getElementById('negative').value.trim(),
+          aspect_ratio: document.getElementById('ar').value, lighting: document.getElementById('lighting').value.trim(),
+          color_grade: document.getElementById('color_grade').value.trim(), extra_tags: document.getElementById('extra_tags').value.trim()
+        });
+        // hide progress after a beat
+        setTimeout(hideProgress, 800);
+      }
+    }catch(e){
+      // ignore transient errors; stop if too long (3 min)
+      const elapsed=(Date.now()-CURRENT.started)/1000;
+      if(elapsed>180){ clearInterval(POLL); POLL=null; setProgress(100,'Timed out'); setTimeout(hideProgress,1200); }
+    }
+  }, 1200);
+}
+
+async function cancelGeneration(){
+  if(!CURRENT.pid){ hideProgress(); return; }
+  try{ await fetch('/generate/comfy_cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt_id:CURRENT.pid})}); }catch(e){}
+  if(POLL) clearInterval(POLL); POLL=null;
+  setProgress(0,'Canceled'); setTimeout(hideProgress, 800);
+}
+
+document.addEventListener('DOMContentLoaded', ()=>{ loadAllPresets(); renderHistory(); });
+</script>
+</body>
+</html>
+"""
