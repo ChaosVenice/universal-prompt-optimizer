@@ -1,6 +1,8 @@
 import os
 import time
 import json
+import io
+import zipfile
 from urllib import request as urlreq
 from urllib.error import URLError, HTTPError
 import re
@@ -342,6 +344,7 @@ h3{margin:8px 0}select, input[type="text"] {height:40px}textarea {min-height:110
         <button onclick="copyText('sdxlBox')">Copy JSON</button>
         <button onclick="downloadText('sdxl.json','sdxlBox')">Download JSON</button>
         <button class="secondary" id="genComfyBtn" onclick="generateComfy()">Generate (ComfyUI)</button>
+        <button class="secondary" id="zipBtn" style="display:none" onclick="downloadZip(LAST_IMAGES)">Download ZIP</button>
       </div>
       <div id="sdxlBox" class="box section kv"></div>
       <div class="imgwrap" id="genImages"></div>
@@ -420,6 +423,7 @@ h3{margin:8px 0}select, input[type="text"] {height:40px}textarea {min-height:110
 const LS_KEY = 'upo_presets_v1';
 const LS_SETTINGS = 'upo_settings_v1';
 const LS_HISTORY = 'upo_history_v1';
+let LAST_IMAGES = [];
 
 function getForm(){
   return {
@@ -563,6 +567,20 @@ function downloadText(filename, id){
   a.href = url; a.download = filename; a.click();
   setTimeout(()=>URL.revokeObjectURL(url), 1000);
 }
+async function downloadZip(urls){
+  if(!urls || !urls.length){ alert('No images to zip.'); return; }
+  const res = await fetch('/zip', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ urls })
+  });
+  if(!res.ok){ alert('ZIP failed.'); return; }
+  const blob = await res.blob();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'upo_outputs.zip';
+  a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 1000);
+}
 
 // History
 function loadHistory(){
@@ -618,7 +636,11 @@ function renderHistory(){
     dl.className = 'secondary';
     dl.textContent = 'Download All';
     dl.onclick = ()=>downloadAll(h.images||[]);
-    btns.appendChild(rerun); btns.appendChild(dl);
+    const zip = document.createElement('button');
+    zip.className = 'secondary';
+    zip.textContent = 'ZIP';
+    zip.onclick = ()=>downloadZip(h.images||[]);
+    btns.appendChild(rerun); btns.appendChild(dl); btns.appendChild(zip);
     div.appendChild(img); div.appendChild(meta); div.appendChild(btns);
     grid.appendChild(div);
   });
@@ -663,6 +685,7 @@ async function optimize(){
   const s = JSON.parse(localStorage.getItem(LS_SETTINGS) || '{}');
   document.getElementById('genComfyBtn').style.display = s.host ? 'inline-block' : 'none';
   document.getElementById('genImages').innerHTML = '';
+  document.getElementById('zipBtn').style.display = 'none';
 }
 
 // Direct generation (ComfyUI)
@@ -698,6 +721,9 @@ async function generateComfy(){
   (out.images || []).forEach(url=>{
     const img = document.createElement('img'); img.src = url; wrap.appendChild(img);
   });
+
+  LAST_IMAGES = out.images || [];
+  document.getElementById('zipBtn').style.display = LAST_IMAGES.length ? 'inline-block' : 'none';
 
   // Add to history
   try{
@@ -956,6 +982,35 @@ def generate_comfy():
         return jsonify({"error": f"Network error contacting ComfyUI: {e}"}), 502
     except Exception as e:
         return jsonify({"error": f"Unexpected error: {e}"}), 500
+
+@app.post("/zip")
+def zip_images():
+    """
+    Body: { "urls": ["http://host/view?filename=...","..."] }
+    Returns: application/zip of all images (skips any that fail)
+    """
+    data = request.get_json(force=True)
+    urls = data.get("urls") or []
+    if not isinstance(urls, list) or not urls:
+        return jsonify({"error": "No urls provided"}), 400
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for i, u in enumerate(urls):
+            try:
+                with urlreq.urlopen(u, timeout=20) as resp:
+                    content = resp.read()
+                # naive extension guess; ComfyUI serves PNG by default
+                z.writestr(f"image_{i+1}.png", content)
+            except Exception:
+                # skip errors silently to still return a ZIP for the rest
+                continue
+    buf.seek(0)
+    return Response(
+        buf.getvalue(),
+        mimetype="application/zip",
+        headers={"Content-Disposition": "attachment; filename=upo_outputs.zip"}
+    )
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
