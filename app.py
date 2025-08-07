@@ -81,7 +81,7 @@ def dedup_preserve(seq):
             out.append(x)
     return out
 
-def clamp_length(s: str, max_chars=900):
+def clamp_length(s: str, max_chars=850):
     """Prevent overly long prompts that degrade quality."""
     return (s[:max_chars] + "…") if len(s) > max_chars else s
 
@@ -105,35 +105,41 @@ def extract_categories(user_text: str):
     return found, subject_terms
 
 def build_positive(subject_terms, found, extras):
-    """Construct optimized positive prompt."""
-    # Core sections in deliberate order
-    quality = ", ".join(dedup_preserve(found["quality"][:4])) or "masterpiece, best quality, highly detailed"
-    subject = ", ".join(subject_terms[:6]) if subject_terms else "primary subject"
-    style   = ", ".join(dedup_preserve(found["art_styles"][:4] + found["photography"][:3]))
-    comp    = ", ".join(dedup_preserve(found["composition"][:2]))
-    mood    = ", ".join(dedup_preserve(found["mood"][:2]))
+    """Construct optimized positive prompt with strict order: quality → subject → style → lighting → composition → mood → color grade → extra tags."""
+    # Strict order as specified
+    quality = ", ".join(dedup_preserve(found["quality"][:3])) or "masterpiece, best quality, highly detailed"
+    subject = ", ".join(subject_terms[:5]) if subject_terms else "primary subject"
+    style = ", ".join(dedup_preserve(found["art_styles"][:2] + found["photography"][:2]))
+    lighting = extras.get("lighting", "").strip()
+    comp = ", ".join(dedup_preserve(found["composition"][:2]))
+    mood = ", ".join(dedup_preserve(found["mood"][:2]))
+    color_grade = extras.get("color_grade", "").strip()
+    extra_tags = extras.get("extra_tags", "").strip()
 
-    parts = [quality, subject]
+    # Build in exact order, skip empty sections
+    parts = []
+    if quality: parts.append(quality)
+    if subject: parts.append(subject)
     if style: parts.append(style)
-    if extras.get("lighting"): parts.append(extras["lighting"])
+    if lighting: parts.append(lighting)
     if comp: parts.append(comp)
     if mood: parts.append(mood)
-    if extras.get("color_grade"): parts.append(extras["color_grade"])
-    if extras.get("extra_tags"): parts.append(extras["extra_tags"])
+    if color_grade: parts.append(color_grade)
+    if extra_tags: parts.append(extra_tags)
 
-    # remove double spaces/commas and clamp
+    # Clean and clamp to 800-900 chars
     pos = ", ".join([p.strip(", ").replace("  ", " ") for p in parts if p])
     pos = re.sub(r"(, ){2,}", ", ", pos)
-    return clamp_length(pos, 900)
+    return clamp_length(pos, 850)
 
 def build_negative(user_negative: str):
-    """Construct enhanced negative prompt."""
+    """Construct enhanced negative prompt covering anatomy/structure, artifacts/quality, branding/text, style pitfalls."""
     user_list = []
     if user_negative:
         user_list = [x.strip() for x in user_negative.split(",") if x.strip()]
     neg = dedup_preserve(NEGATIVE_DEFAULT + user_list)
     neg = ", ".join(neg)
-    return clamp_length(neg, 900)
+    return clamp_length(neg, 850)
 
 def sdxl_prompt(positive, negative, ar):
     """Generate SDXL-optimized prompt configuration."""
@@ -154,7 +160,7 @@ def sdxl_prompt(positive, negative, ar):
     }
 
 def comfyui_recipe(positive, negative, ar):
-    """Generate ComfyUI workflow configuration."""
+    """Generate ComfyUI workflow configuration with execution tips."""
     w, h = AR_TO_RES.get(ar, (1024, 1024))
     return {
         "positive": positive,
@@ -169,22 +175,21 @@ def comfyui_recipe(positive, negative, ar):
             "width": w,
             "height": h
         },
-        "tips": "If faces look off, lower CFG to 5.5–6.0 and increase steps to 40."
+        "tips": "If faces or hands break: lower CFG to 5.5–6.0, increase steps to 36–40."
     }
 
 def midjourney_prompt(positive, ar):
-    """Generate Midjourney-optimized prompt."""
-    ar_flag = "--ar 1:1" if ar == "1:1" else ("--ar 16:9" if ar == "16:9" else ("--ar 9:16" if ar == "9:16" else f"--ar {ar}"))
-    # Avoid words MJ sometimes dislikes (e.g., 'masterpiece' is fine generally, but keep it simple)
+    """Generate Midjourney v6 prompt string."""
+    ar_flag = f"--ar {ar}"
+    # Replace "8k" with "ultra high detail" for MJ compatibility
     clean_positive = positive.replace("8k", "ultra high detail")
     return f"{clean_positive} --v 6 {ar_flag} --stylize 200 --chaos 5"
 
 def pika_prompt(positive):
     """Generate Pika Labs video prompt configuration."""
-    motion = "subtle camera push-in, natural parallax, no warping, maintain structure"
     return {
         "prompt": f"{positive}, animated micro-details, smooth motion, temporal consistency",
-        "motion": motion,
+        "motion": "subtle camera push-in, natural parallax, no warping",
         "duration_sec": 6,
         "guidance": 7.0
     }
@@ -196,7 +201,7 @@ def runway_prompt(positive):
         "camera_motion": "push_in",
         "motion_strength": "medium",
         "duration_sec": 5,
-        "notes": "For text-to-video, keep subject centrally framed to reduce morphing."
+        "notes": "Keep subject centrally framed to reduce morphing."
     }
 
 # ---------------------------
@@ -392,7 +397,59 @@ def optimize():
             "comfyui": comfyui_recipe(positive, negative, aspect_ratio),
             "midjourney": midjourney_prompt(positive, aspect_ratio),
             "pika": pika_prompt(positive),
-            "runway": runway_prompt(positive)
+            "runway": runway_prompt(positive),
+            "hints": {
+                "busy_output": "If output looks busy, cut adjectives first, then reduce style tags to 2–4 max.",
+                "face_hands_fix": "If faces or hands break: lower CFG to 5.5–6.0, increase steps to 36–40.",
+                "motion_warping": "If motion warps: simplify subject, keep it centered, reduce motion strength."
+            }
+        }
+
+        return jsonify(output)
+    
+    except Exception as e:
+        return jsonify({"error": f"Processing failed: {str(e)}"}), 500
+
+@app.route("/api/optimize", methods=["POST"])
+def api_optimize():
+    """Direct API endpoint for JSON-only optimization with minimal overhead."""
+    try:
+        data = request.get_json(force=True)
+        user_text = (data.get("idea") or "").strip()
+        user_negative = (data.get("negative") or "").strip()
+        aspect_ratio = (data.get("aspect_ratio") or "1:1").strip()
+        
+        if not user_text:
+            return jsonify({"error": "idea field is required"}), 400
+
+        # Extract lighting/color/tags from idea text if not provided separately
+        extras = {
+            "lighting": "",
+            "color_grade": "",
+            "extra_tags": "",
+        }
+
+        # Process the user input
+        found, subject_terms = extract_categories(user_text)
+        positive = build_positive(subject_terms, found, extras)
+        negative = build_negative(user_negative)
+
+        # Return exact format specified
+        output = {
+            "unified": {
+                "positive": positive,
+                "negative": negative
+            },
+            "sdxl": sdxl_prompt(positive, negative, aspect_ratio),
+            "comfyui": comfyui_recipe(positive, negative, aspect_ratio),
+            "midjourney": midjourney_prompt(positive, aspect_ratio),
+            "pika": pika_prompt(positive),
+            "runway": runway_prompt(positive),
+            "hints": {
+                "busy_output": "If output looks busy, cut adjectives first, then reduce style tags to 2–4 max.",
+                "face_hands_fix": "If faces or hands break: lower CFG to 5.5–6.0, increase steps to 36–40.",
+                "motion_warping": "If motion warps: simplify subject, keep it centered, reduce motion strength."
+            }
         }
 
         return jsonify(output)
