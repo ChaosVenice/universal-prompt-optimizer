@@ -11,11 +11,72 @@ import random
 import sqlite3
 import datetime
 import secrets
+import smtplib
+import urllib.parse
+import urllib.request
+from email.mime.text import MIMEText
+from email.utils import formatdate
 from functools import wraps
 from flask import Flask, request, jsonify, Response, g, abort
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SESSION_SECRET")
+
+# --- EMAIL UTILS ---
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+FROM_EMAIL = os.getenv("FROM_EMAIL", "")
+
+def send_email(to_email: str, subject: str, text: str):
+    """Try SendGrid first, then SMTP, else no-op (logs to server)."""
+    if not to_email or not FROM_EMAIL:
+        print("[email] Missing to_email or FROM_EMAIL; skipping email.")
+        return False
+
+    # 1) SendGrid API
+    if SENDGRID_API_KEY:
+        try:
+            import urllib.request, urllib.error
+            url = "https://api.sendgrid.com/v3/mail/send"
+            body = {
+                "personalizations": [{"to": [{"email": to_email}], "subject": subject}],
+                "from": {"email": FROM_EMAIL},
+                "content": [{"type": "text/plain", "value": text}],
+            }
+            req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), method="POST")
+            req.add_header("Authorization", f"Bearer {SENDGRID_API_KEY}")
+            req.add_header("Content-Type", "application/json")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                _ = resp.read()
+            print(f"[email] Sent via SendGrid to {to_email}")
+            return True
+        except Exception as e:
+            print(f"[email] SendGrid failed: {e}")
+
+    # 2) SMTP fallback
+    if SMTP_HOST and SMTP_USER and SMTP_PASS:
+        try:
+            msg = MIMEText(text, "plain", "utf-8")
+            msg["Subject"] = subject
+            msg["From"] = FROM_EMAIL
+            msg["To"] = to_email
+            msg["Date"] = formatdate(localtime=True)
+
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+                server.starttls()
+                server.login(SMTP_USER, SMTP_PASS)
+                server.sendmail(FROM_EMAIL, [to_email], msg.as_string())
+            print(f"[email] Sent via SMTP to {to_email}")
+            return True
+        except Exception as e:
+            print(f"[email] SMTP failed: {e}")
+
+    # 3) Nothing configured – log only
+    print(f"[email] No email provider configured. Would send to {to_email}: {subject}\n{text}")
+    return False
 
 # --- API key storage + helpers ---
 DB_PATH = os.getenv("USAGE_DB", "usage.db")
@@ -158,12 +219,22 @@ def usage_charge():
     newc = _inc_usage(g.api_key, amt)
     return jsonify({"ok": True, "used": newc, "limit": g.daily_limit, "remaining": max(0, g.daily_limit - newc)})
 
-# --- Stripe plan mapping + webhook + admin key ops ---
+# --- STRIPE WEBHOOK (with email notifications) ---
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:5000")
+
 # Map Stripe Price IDs to key configuration
-# EDIT THESE to your Stripe Price IDs & desired quotas/durations
+# EDIT THESE to your actual Stripe Price IDs when ready to use payments
 PLAN_MAP = {
-    # "price_12345": {"plan":"starter", "daily_limit": 50,  "days_valid": 30},
-    # "price_67890": {"plan":"pro",     "daily_limit": 200, "days_valid": 30},
+    # Example configurations - replace with your actual Stripe Price IDs:
+    # "price_1AbCdEfGhIjKlMnO": {"plan":"basic","daily_limit":50,"days_valid":30},
+    # "price_1XyZwVuTsRqPoNm": {"plan":"pro","daily_limit":200,"days_valid":30},
+}
+
+# Map human plan names -> Stripe Price IDs (edit these to match your products)
+PRICE_MAP = {
+    # Example configurations - replace with your actual plan mapping:
+    # "basic": "price_1AbCdEfGhIjKlMnO",
+    # "pro":   "price_1XyZwVuTsRqPoNm",
 }
 
 STRIPE_API_KEY = os.getenv("STRIPE_API_KEY", "")
@@ -172,56 +243,10 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 def _expire_date(days):
     return (datetime.date.today() + datetime.timedelta(days=int(days))).isoformat()
 
-@app.post("/stripe/webhook")
-def stripe_webhook():
-    # If you install stripe==5.x, uncomment the verification section and use stripe.Webhook.construct_event
-    payload = request.get_data(as_text=True)
-    sig = request.headers.get("Stripe-Signature","")
-
-    # Minimal parsing
-    try:
-        event = json.loads(payload)
-    except Exception:
-        return jsonify({"error":"Invalid payload"}), 400
-
-    etype = event.get("type")
-    data_obj = (event.get("data") or {}).get("object") or {}
-
-    # Handle both one-time Checkout and subscription Invoice paid
-    if etype == "checkout.session.completed":
-        email = (data_obj.get("customer_details") or {}).get("email") or data_obj.get("customer_email") or ""
-        line_items = data_obj.get("display_items") or []  # legacy
-        price_id = None
-        # Prefer modern API: session has 'line_items' if you expand; if not present, rely on metadata
-        # Try metadata.price_id first
-        price_id = (data_obj.get("metadata") or {}).get("price_id") or price_id
-        # If your Checkout passes price_id in metadata, you're good. Otherwise configure your webhook to expand line_items.
-
-        if not price_id and line_items:
-            try: price_id = line_items[0]["price"]["id"]
-            except: pass
-
-        return _issue_key_from_price(email, price_id)
-
-    elif etype in ("invoice.paid", "customer.subscription.created"):
-        # Subscriptions: read price from first line item
-        lines = (data_obj.get("lines") or {}).get("data") or []
-        price_id = None
-        if lines:
-            try: price_id = lines[0]["price"]["id"]
-            except: pass
-        customer_email = (data_obj.get("customer_email") or
-                          ((data_obj.get("customer") or {}).get("email")) or "")
-        # In practice you might need to fetch customer by ID; skipping for simplicity.
-        return _issue_key_from_price(customer_email, price_id)
-
-    # Ignore other events
-    return jsonify({"ok": True})
-
 def _issue_key_from_price(email, price_id):
     if not price_id or price_id not in PLAN_MAP:
-        # Unknown price -> ignore or log
         return jsonify({"ok": True, "note": "Unknown price_id; no key issued"}), 200
+
     plan = PLAN_MAP[price_id]
     key = gen_key("live_")
     expires_at = _expire_date(plan["days_valid"])
@@ -230,8 +255,57 @@ def _issue_key_from_price(email, price_id):
         daily_limit=plan["daily_limit"], expires_at=expires_at,
         status="active", notes=f"issued via webhook price={price_id}"
     )
-    # TODO: send email with key; for now return OK. You can wire SMTP/SendGrid later.
-    return jsonify({"ok": True, "api_key": key, "plan": plan, "email": email, "expires_at": expires_at})
+
+    # Email the key
+    subject = "Your Universal Prompt Optimizer API Key"
+    text = f"""Thanks for your purchase!
+
+Plan: {plan['plan']}
+Daily limit: {plan['daily_limit']} generations/day
+Expires: {expires_at}
+
+Your API Key:
+{key}
+
+How to use:
+1) Open the app, click Settings.
+2) Paste the key in "API Key".
+3) Click Save. You'll see your remaining quota.
+
+Keep this key secret. If you need help, just reply to this email.
+
+— UPO Team
+"""
+    ok = send_email(email, subject, text)
+    return jsonify({"ok": True, "api_key": key, "emailed": ok}), 200
+
+@app.post("/stripe/webhook")
+def stripe_webhook():
+    # Minimal parse (SDK verification optional)
+    try:
+        event = json.loads(request.get_data(as_text=True))
+    except Exception:
+        return jsonify({"error":"Invalid payload"}), 400
+
+    etype = event.get("type")
+    obj = (event.get("data") or {}).get("object") or {}
+
+    if etype == "checkout.session.completed":
+        email = (obj.get("customer_details") or {}).get("email") or obj.get("customer_email") or ""
+        # We recommend passing price_id via Checkout Session metadata for reliability:
+        price_id = (obj.get("metadata") or {}).get("price_id")
+        return _issue_key_from_price(email, price_id)
+
+    elif etype in ("invoice.paid", "customer.subscription.created"):
+        lines = (obj.get("lines") or {}).get("data") or []
+        price_id = None
+        if lines:
+            try: price_id = lines[0]["price"]["id"]
+            except: pass
+        email = obj.get("customer_email") or ""
+        return _issue_key_from_price(email, price_id)
+
+    return jsonify({"ok": True})
 
 # -------- Admin endpoints (manual ops) --------
 @app.post("/admin/issue")
@@ -281,6 +355,116 @@ def admin_keys():
             "expires_at": r[4], "status": r[5], "created_at": r[6]
         })
     return jsonify({"keys": items})
+
+# --- CHECKOUT + BUY PAGE ---
+@app.post("/checkout/create")
+def checkout_create():
+    """
+    Body: { "plan": "basic", "email": "buyer@example.com" }
+    Returns: { "url": "https://checkout.stripe.com/..." }
+    """
+    data = request.get_json(force=True)
+    plan = (data.get("plan") or "").strip()
+    email = (data.get("email") or "").strip()
+    price_id = PRICE_MAP.get(plan)
+    if not price_id:
+        return jsonify({"error":"Unknown plan"}), 400
+
+    # Create Checkout Session via Stripe API (no SDK)
+    # Also pass price_id in metadata so webhook can read it reliably
+    form = {
+        "mode": "payment",
+        "success_url": f"{PUBLIC_BASE_URL}/buy?success=1",
+        "cancel_url": f"{PUBLIC_BASE_URL}/buy?canceled=1",
+        "line_items[0][price]": price_id,
+        "line_items[0][quantity]": "1",
+        "metadata[price_id]": price_id,
+    }
+    if email:
+        form["customer_email"] = email
+
+    body = urllib.parse.urlencode(form).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.stripe.com/v1/checkout/sessions",
+        data=body, method="POST",
+        headers={"Authorization": f"Bearer {os.getenv('STRIPE_API_KEY','')}",
+                 "Content-Type": "application/x-www-form-urlencoded"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            out = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        return jsonify({"error": f"Stripe error: {e}"}), 502
+
+    return jsonify({"url": out.get("url")})
+
+# Minimal "Buy" page (client-side)
+BUY_HTML = """
+<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Buy API Access – Universal Prompt Optimizer</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#0b0f14;color:#e7edf5;margin:0}
+.wrap{max-width:720px;margin:40px auto;padding:0 16px}
+.card{background:#111826;border:1px solid #1f2a3a;border-radius:14px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.25);margin-bottom:16px}
+label{display:block;margin:8px 0 4px;color:#9fb2c7}
+input,select,button{width:100%;padding:10px 12px;border-radius:10px;border:1px solid #243447;background:#0f141c;color:#e7edf5}
+button{background:#2f6df6;border:none;font-weight:700;cursor:pointer;margin-top:10px}
+small{color:#9fb2c7}
+.notice{padding:10px;border-radius:10px;margin-bottom:12px}
+.ok{background:#10261a;border:1px solid #1f6d3a;color:#a8e1bd}
+.err{background:#2a0f13;border:1px solid #7a2230;color:#f2b6c0}
+</style></head>
+<body>
+<div class="wrap">
+  <h1>Buy API Access</h1>
+  <p>Pay once, receive an email with your API key instantly. Paste it in the app under <b>Settings → API Key</b>.</p>
+
+  <div id="msg"></div>
+
+  <div class="card">
+    <label>Email (receive your key)</label>
+    <input id="email" type="email" placeholder="you@example.com">
+
+    <label>Plan</label>
+    <select id="plan">
+      <option value="basic">Basic – 50/day, 30 days</option>
+      <option value="pro">Pro – 200/day, 30 days</option>
+    </select>
+
+    <button onclick="checkout()">Proceed to Payment</button>
+    <small>Payments handled by Stripe. You'll be redirected.</small>
+  </div>
+
+  <div class="card">
+    <h3>After payment</h3>
+    <p>Check your inbox for <b>"Your Universal Prompt Optimizer API Key"</b>. If it doesn't arrive in 2 minutes, check spam or contact support.</p>
+  </div>
+</div>
+<script>
+function qs(k){ return new URLSearchParams(location.search).get(k); }
+(function init(){
+  const m=document.getElementById('msg');
+  if(qs('success')) m.innerHTML='<div class="notice ok">Payment received! Your API key is being emailed to you. Please check your inbox.</div>';
+  if(qs('canceled')) m.innerHTML='<div class="notice err">Payment canceled. You can try again anytime.</div>';
+})();
+async function checkout(){
+  const email=document.getElementById('email').value.trim();
+  const plan=document.getElementById('plan').value;
+  if(!email){ alert('Enter your email'); return; }
+  const res=await fetch('/checkout/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({plan,email})});
+  const out=await res.json();
+  if(!res.ok || !out.url){ alert(out.error||'Failed to create checkout'); return; }
+  location.href = out.url;
+}
+</script>
+</body></html>
+"""
+
+@app.get("/buy")
+def buy_page():
+    return BUY_HTML
 
 # ---------------------------
 # Prompt Enhancement Engine
@@ -708,8 +892,9 @@ h3{margin:8px 0}select, input[type="text"] {height:40px}textarea {min-height:110
     <div class="row">
       <div class="col">
         <label>API Key (required for generation)</label>
-        <input id="apiKey" placeholder="enter your key">
+        <input id="apiKey" placeholder="enter your key or use demo123">
         <small id="quotaLine" class="small"></small>
+        <small style="color:#9fb2c7;margin-top:4px;display:block;">Need a key? <a href="/buy" target="_blank" style="color:#4f9eff;">Buy API access</a> or use demo123 for testing</small>
       </div>
     </div>
     <div class="row">

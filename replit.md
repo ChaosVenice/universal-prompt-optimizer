@@ -37,6 +37,18 @@ Environment-based configuration is implemented for sensitive settings like sessi
 - **ADMIN_TOKEN**: Admin authentication token for management endpoints
 - **STRIPE_API_KEY**: Stripe API key for payment processing (optional)
 - **STRIPE_WEBHOOK_SECRET**: Stripe webhook signing secret (optional)
+- **PUBLIC_BASE_URL**: Base URL for success/cancel redirects (e.g., "https://your-app.onreplit.app")
+- **FROM_EMAIL**: Email address for sending API keys to customers
+
+### Email Configuration (choose one)
+**SendGrid (recommended):**
+- **SENDGRID_API_KEY**: SendGrid API key for email delivery
+
+**SMTP fallback:**
+- **SMTP_HOST**: SMTP server hostname
+- **SMTP_PORT**: SMTP server port (default: 587)
+- **SMTP_USER**: SMTP username
+- **SMTP_PASS**: SMTP password
 
 ### Stripe Integration Setup
 Configure PLAN_MAP in app.py with your Stripe Price IDs:
@@ -54,7 +66,8 @@ The service provides comprehensive endpoints for prompt optimization and image g
 - **Optimization API** (`/optimize`, `/api/optimize`): JSON endpoints accepting `{idea, negative, aspect_ratio, lighting, color_grade, extra_tags}` and returning complete platform configurations
 - **ComfyUI Generation** (`/generate/comfy`, `/generate/comfy_async`): Direct and async image generation with parameter overrides, workflow customization, and per-key API protection
 - **Authentication System** (`/auth/check`, `/usage`, `/usage/charge`): Database-backed API key validation with expiry dates, individual daily quota tracking, and usage management
-- **Stripe Integration** (`/stripe/webhook`): Automated API key provisioning for checkout completions and subscription payments with configurable plan mapping
+- **Stripe Integration** (`/stripe/webhook`): Automated API key provisioning for checkout completions and subscription payments with configurable plan mapping and email notifications
+- **Checkout System** (`/checkout/create`, `/buy`): Stripe Checkout integration with dedicated buy page for seamless payment flow and instant API key delivery
 - **Admin Management** (`/admin/issue`, `/admin/revoke`, `/admin/update_limit`, `/admin/keys`): Manual API key operations for customer support and key lifecycle management
 - **Status Polling** (`/generate/comfy_status`): Real-time generation progress tracking for async workflows with authentication
 - **ZIP Downloads** (`/zip`): Bulk image packaging accepting image URLs and returning compressed archives
