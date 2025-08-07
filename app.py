@@ -8,10 +8,101 @@ from urllib.error import URLError, HTTPError
 import re
 from textwrap import dedent
 import random
-from flask import Flask, request, jsonify, Response
+import sqlite3
+import datetime
+from flask import Flask, request, jsonify, Response, g
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SESSION_SECRET")
+
+# ---------------------------
+# Authentication & Quota System
+# ---------------------------
+
+# ENV VARS:
+#   VALID_KEYS: comma-separated list of allowed keys, e.g. "demo123,pro456"
+#   DAILY_LIMIT: integer, default 50
+VALID_KEYS = {k.strip() for k in (os.getenv("VALID_KEYS","demo123").split(","))}
+DAILY_LIMIT = int(os.getenv("DAILY_LIMIT","50"))
+
+DB_PATH = os.getenv("USAGE_DB","usage.db")
+
+def get_db():
+    if "db" not in g:
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.execute("""CREATE TABLE IF NOT EXISTS usage (
+            key TEXT NOT NULL,
+            day TEXT NOT NULL,
+            count INTEGER NOT NULL,
+            PRIMARY KEY (key, day)
+        )""")
+    return g.db
+
+@app.teardown_appcontext
+def close_db(exc):
+    db = g.pop("db", None)
+    if db: db.close()
+
+def _today():
+    return datetime.date.today().isoformat()
+
+def _get_usage(api_key):
+    db = get_db()
+    day = _today()
+    cur = db.execute("SELECT count FROM usage WHERE key=? AND day=?", (api_key, day))
+    row = cur.fetchone()
+    return row[0] if row else 0
+
+def _inc_usage(api_key, amt=1):
+    db = get_db()
+    day = _today()
+    cur = db.execute("SELECT count FROM usage WHERE key=? AND day=?", (api_key, day))
+    row = cur.fetchone()
+    if row:
+        newc = row[0] + amt
+        db.execute("UPDATE usage SET count=? WHERE key=? AND day=?", (newc, api_key, day))
+    else:
+        newc = amt
+        db.execute("INSERT INTO usage(key,day,count) VALUES(?,?,?)", (api_key, day, newc))
+    db.commit()
+    return newc
+
+def require_api_key(func):
+    from functools import wraps
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        key = request.headers.get("X-API-Key","").strip() or (request.get_json(silent=True) or {}).get("api_key","")
+        if key not in VALID_KEYS:
+            return jsonify({"error":"Unauthorized: missing or invalid API key"}), 401
+        # store for downstream
+        g.api_key = key
+        return func(*args, **kwargs)
+    return wrapper
+
+@app.get("/auth/check")
+def auth_check():
+    key = request.headers.get("X-API-Key","").strip()
+    if key in VALID_KEYS:
+        used = _get_usage(key)
+        return jsonify({"ok": True, "limit": DAILY_LIMIT, "used": used, "remaining": max(0, DAILY_LIMIT - used)})
+    return jsonify({"ok": False}), 401
+
+@app.post("/usage/charge")
+@require_api_key
+def usage_charge():
+    data = request.get_json(force=True)
+    amt = int(data.get("amount", 1))
+    used = _get_usage(g.api_key)
+    if used + amt > DAILY_LIMIT:
+        return jsonify({"error":"Daily limit reached", "used": used, "limit": DAILY_LIMIT}), 429
+    newc = _inc_usage(g.api_key, amt)
+    return jsonify({"ok": True, "used": newc, "limit": DAILY_LIMIT, "remaining": max(0, DAILY_LIMIT - newc)})
+
+@app.get("/usage")
+@require_api_key
+def usage_get():
+    used = _get_usage(g.api_key)
+    return jsonify({"limit": DAILY_LIMIT, "used": used, "remaining": max(0, DAILY_LIMIT - used)})
 
 # ---------------------------
 # Prompt Enhancement Engine
@@ -235,6 +326,7 @@ h3{margin:8px 0}select, input[type="text"] {height:40px}textarea {min-height:110
 .meta{font-family:ui-monospace,monospace;font-size:11px;color:#9fb2c7}
 .progress{margin-top:10px;background:#0f141c;border:1px solid #27405e;border-radius:10px;overflow:hidden;height:14px}
 .progress .bar{height:100%;width:0%}
+.badkey{color:#ff6b6b}
 </style>
 </head>
 <body>
@@ -437,6 +529,13 @@ h3{margin:8px 0}select, input[type="text"] {height:40px}textarea {min-height:110
     <h3>ComfyUI Settings</h3>
     <div class="row">
       <div class="col">
+        <label>API Key (required for generation)</label>
+        <input id="apiKey" placeholder="enter your key">
+        <small id="quotaLine" class="small"></small>
+      </div>
+    </div>
+    <div class="row">
+      <div class="col">
         <label>ComfyUI Host (e.g., http://127.0.0.1:8188)</label>
         <input id="comfyHost" placeholder="http://127.0.0.1:8188">
       </div>
@@ -521,9 +620,44 @@ function renderHistory(){
 }
 function downloadAll(urls){ urls.forEach((u,i)=>{ const a=document.createElement('a'); a.href=u; a.download=`image_${i+1}.png`; a.click(); }); }
 
-function openSettings(){ const raw=localStorage.getItem(LS_SETTINGS)||'{}'; const s=JSON.parse(raw); document.getElementById('comfyHost').value=s.host||''; document.getElementById('workflowJson').value=s.workflow||''; document.getElementById('settingsModal').style.display='flex'; }
+function openSettings(){
+  const s = JSON.parse(localStorage.getItem(LS_SETTINGS) || '{}');
+  document.getElementById('apiKey').value = s.apiKey || '';
+  document.getElementById('comfyHost').value = s.host || '';
+  document.getElementById('workflowJson').value = s.workflow || '';
+  document.getElementById('quotaLine').textContent = s.limit ? `Quota: ${s.remaining}/${s.limit} remaining today` : '';
+  document.getElementById('settingsModal').style.display='flex';
+}
 function closeSettings(){ document.getElementById('settingsModal').style.display='none'; }
-function saveSettings(){ const s={ host:document.getElementById('comfyHost').value.trim(), workflow:document.getElementById('workflowJson').value.trim() }; localStorage.setItem(LS_SETTINGS, JSON.stringify(s)); closeSettings(); }
+function saveSettings(){
+  const s = JSON.parse(localStorage.getItem(LS_SETTINGS) || '{}');
+  s.apiKey = document.getElementById('apiKey').value.trim();
+  s.host   = document.getElementById('comfyHost').value.trim();
+  s.workflow = document.getElementById('workflowJson').value.trim();
+  localStorage.setItem(LS_SETTINGS, JSON.stringify(s));
+  refreshQuota();
+  closeSettings();
+}
+
+async function refreshQuota(){
+  const s = JSON.parse(localStorage.getItem(LS_SETTINGS) || '{}');
+  if(!s.apiKey){ setQuotaLine(''); return; }
+  try{
+    const res = await fetch('/usage', { headers: {'X-API-Key': s.apiKey }});
+    const out = await res.json();
+    if(res.ok){
+      s.limit = out.limit; s.remaining = out.remaining; localStorage.setItem(LS_SETTINGS, JSON.stringify(s));
+      setQuotaLine(`Quota: ${out.remaining}/${out.limit} remaining today`);
+    } else {
+      setQuotaLine('Invalid API key', true);
+    }
+  }catch(e){ setQuotaLine(''); }
+}
+function setQuotaLine(text, bad=false){
+  const el = document.getElementById('quotaLine');
+  el.textContent = text || '';
+  el.className = 'small' + (bad ? ' badkey' : '');
+}
 
 function copyText(id){ const el=document.getElementById(id); const txt=el?.innerText||el?.textContent||''; navigator.clipboard.writeText(txt); }
 function downloadText(filename,id){ const el=document.getElementById(id); const txt=el?.innerText||el?.textContent||''; const blob=new Blob([txt],{type:'text/plain'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=filename; a.click(); setTimeout(()=>URL.revokeObjectURL(url),1000); }
@@ -556,24 +690,33 @@ function setProgress(pct, text){ const bar=document.getElementById('progressBar'
 async function generateComfyAsync(){
   const s=JSON.parse(localStorage.getItem(LS_SETTINGS)||'{}');
   if(!s.host){ alert('Set your ComfyUI host in Settings.'); return; }
-  let sdxlJson={}; try{ sdxlJson=JSON.parse(document.getElementById('sdxlBox').textContent||'{}'); }catch(e){ alert('Invalid SDXL JSON. Run "Optimize" first.'); return; }
-  const payload={host:s.host,workflow_override:s.workflow||'',sdxl:sdxlJson,advanced:{steps:document.getElementById('steps').value.trim(),cfg_scale:document.getElementById('cfg').value.trim(),sampler:document.getElementById('sampler').value,seed:document.getElementById('seed').value.trim(),batch:document.getElementById('batch').value.trim()}};
-  try{
-    showProgress(); LAST_IMAGES=[];
-    const res=await fetch('/generate/comfy_async',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-    const out=await res.json();
-    if(!res.ok||out.error){ hideProgress(); alert(`Queue failed: ${out.error||'Unknown error'}`); return; }
-    CURRENT={host:s.host,pid:out.prompt_id,expected:out.batch||1,started:Date.now()};
-    setProgress(5,`Queued (${out.prompt_id})`);
-    POLL=setInterval(pollStatus,1500);
-  }catch(err){ hideProgress(); alert(`Network error: ${err.message}`); }
+  if(!s.apiKey){ alert('Enter your API key in Settings.'); return; }
+  let sdxlJson={}; try{ sdxlJson=JSON.parse(document.getElementById('sdxlBox').textContent||'{}'); }catch(e){ alert('Invalid SDXL JSON—click Optimize again.'); return; }
+  const f=getForm();
+  const advanced={ steps:f.steps, cfg_scale:f.cfg_scale, sampler:f.sampler, seed:f.seed, batch:f.batch };
+
+  // queue job
+  const q=await fetch('/generate/comfy_async',{
+    method:'POST',
+    headers:{'Content-Type':'application/json', 'X-API-Key': s.apiKey},
+    body:JSON.stringify({ host:s.host, workflow_override:s.workflow||'', sdxl:sdxlJson, advanced })
+  });
+  const qo=await q.json();
+  if(!q.ok){ alert(qo.error||'Queue failed.'); refreshQuota(); return; }
+
+  CURRENT={ host:s.host, pid:qo.prompt_id, expected:Number(qo.batch||1), started:Date.now() };
+  showProgress(); document.getElementById('genImages').innerHTML=''; LAST_IMAGES=[];
+
+  if(POLL) clearInterval(POLL);
+  POLL=setInterval(pollStatus,1500);
 }
 
 async function pollStatus(){
   if(!CURRENT.pid) return;
+  const s=JSON.parse(localStorage.getItem(LS_SETTINGS)||'{}');
   try{
     const url=`/generate/comfy_status?host=${encodeURIComponent(CURRENT.host)}&pid=${encodeURIComponent(CURRENT.pid)}`;
-    const res=await fetch(url);
+    const res=await fetch(url, { headers: {'X-API-Key': s.apiKey }});
     const out=await res.json();
     if(!res.ok||out.error){ clearInterval(POLL); hideProgress(); alert(`Status error: ${out.error||'Unknown'}`); return; }
     const found=out.images||[]; const elapsed=((Date.now()-CURRENT.started)/1000).toFixed(0);
@@ -582,6 +725,17 @@ async function pollStatus(){
       LAST_IMAGES=found; const wrap=document.getElementById('genImages'); wrap.innerHTML='';
       found.forEach(url=>{const img=document.createElement('img'); img.src=url; img.alt='Generated image'; img.loading='lazy'; wrap.appendChild(img);});
       document.getElementById('zipBtn').style.display='inline-block';
+      
+      // Charge usage
+      try{
+        await fetch('/usage/charge',{
+          method:'POST',
+          headers:{'Content-Type':'application/json', 'X-API-Key': s.apiKey},
+          body:JSON.stringify({amount: CURRENT.expected})
+        });
+        refreshQuota();
+      }catch(e){}
+      
       const form=getForm(); const historyRecord={ts:Date.now(),idea:form.idea,negative:form.negative,aspect_ratio:form.aspect_ratio,lighting:form.lighting,color_grade:form.color_grade,extra_tags:form.extra_tags,steps:form.steps||'30',cfg_scale:form.cfg_scale||'6.5',sampler:form.sampler||'DPM++ 2M Karras',seed:form.seed||'random',batch:form.batch||'1',width:1024,height:1024,images:LAST_IMAGES}; addHistory(historyRecord);
     }else{
       const pct=Math.min(95,10+((found.length/CURRENT.expected)*85));
@@ -594,7 +748,7 @@ function cancelGeneration(){ if(POLL){ clearInterval(POLL); POLL=null; } hidePro
 
 function reRun(h){ if(!h) return; setForm({idea:h.idea||'',negative:h.negative||'',aspect_ratio:h.aspect_ratio||'16:9',lighting:h.lighting||'',color_grade:h.color_grade||'',extra_tags:h.extra_tags||'',steps:h.steps||'',cfg_scale:h.cfg_scale||'',sampler:h.sampler||'DPM++ 2M Karras',seed:h.seed||'',batch:h.batch||''}); optimize(); }
 
-document.addEventListener('DOMContentLoaded',()=>{ loadAllPresets(); renderHistory(); });
+document.addEventListener('DOMContentLoaded',()=>{ loadAllPresets(); renderHistory(); refreshQuota(); });
 </script>
 </body>
 </html>
@@ -655,6 +809,7 @@ _SAMPLER_MAP = {
 }
 
 @app.route("/generate/comfy_async", methods=["POST"])
+@require_api_key
 def generate_comfy_async():
     """
     Queues a ComfyUI job and returns prompt_id immediately for polling.
@@ -730,6 +885,7 @@ def generate_comfy_async():
         return jsonify({"error": f"Queue error: {e}"}), 502
 
 @app.route("/generate/comfy_status", methods=["GET"])
+@require_api_key
 def generate_comfy_status():
     """
     Query: host=http://127.0.0.1:8188&pid=<prompt_id>
@@ -797,6 +953,7 @@ def _http_get_json(url):
         return json.loads(response.read().decode())
 
 @app.route("/generate/comfy", methods=["POST"])
+@require_api_key
 def generate_comfy():
     """
     Body: {

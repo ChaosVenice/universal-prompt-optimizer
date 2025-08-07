@@ -1,6 +1,6 @@
 # Overview
 
-This is a Flask-based Universal Prompt Optimizer that transforms rough creative ideas into professional, platform-ready prompts for multiple AI generation services. The application uses heuristic analysis to categorize and enhance user input, generating optimized prompts for SDXL, ComfyUI, Midjourney v6, Pika Labs, and Runway ML. The system follows strict prompt structure ordering (quality → subject → style → lighting → composition → mood → color grade → extra tags) and includes comprehensive negative prompting and platform-specific configuration hints.
+This is a Flask-based Universal Prompt Optimizer that transforms rough creative ideas into professional, platform-ready prompts for multiple AI generation services. The application uses heuristic analysis to categorize and enhance user input, generating optimized prompts for SDXL, ComfyUI, Midjourney v6, Pika Labs, and Runway ML. The system follows strict prompt structure ordering (quality → subject → style → lighting → composition → mood → color grade → extra tags) and includes comprehensive negative prompting, platform-specific configuration hints, API key authentication, and daily usage quotas with SQLite tracking.
 
 # User Preferences
 
@@ -34,13 +34,17 @@ Environment-based configuration is implemented for sensitive settings like sessi
 ## API Structure
 The service provides comprehensive endpoints for prompt optimization and image generation:
 
-- **Web Interface** (`/`): Interactive dark-themed UI with advanced controls, presets, and complete history management
+- **Web Interface** (`/`): Interactive dark-themed UI with advanced controls, presets, complete history management, and API key authentication
 - **Optimization API** (`/optimize`, `/api/optimize`): JSON endpoints accepting `{idea, negative, aspect_ratio, lighting, color_grade, extra_tags}` and returning complete platform configurations
-- **ComfyUI Generation** (`/generate/comfy`): Direct image generation with parameter overrides and workflow customization
+- **ComfyUI Generation** (`/generate/comfy`, `/generate/comfy_async`): Direct and async image generation with parameter overrides, workflow customization, and API key protection
+- **Authentication System** (`/auth/check`, `/usage`, `/usage/charge`): API key validation, daily quota tracking, and usage management with SQLite backend
+- **Status Polling** (`/generate/comfy_status`): Real-time generation progress tracking for async workflows
 - **ZIP Downloads** (`/zip`): Bulk image packaging accepting image URLs and returning compressed archives
 - **Response Format**: Returns unified prompts plus platform-specific configurations (SDXL settings, ComfyUI workflows, Midjourney flags, video motion parameters)
 - **Advanced Controls**: Steps, CFG scale, sampler selection, seed management, and batch size controls (1-8 images)
 - **History System**: Local storage with up to 200 generation records, complete with re-run capabilities and bulk downloads
+- **Progress Tracking**: Real-time progress bars with cancellation capabilities for long-running operations
+- **Usage Quotas**: Daily generation limits with automatic usage charging and remaining quota display
 - **Error Handling**: Comprehensive validation with loading states and user-friendly error messages
 - **Execution Hints**: Built-in troubleshooting guidance for common generation issues (faces, motion warping, busy outputs)
 
@@ -48,7 +52,8 @@ The service provides comprehensive endpoints for prompt optimization and image g
 
 ## Core Framework
 - **Flask**: Web application framework for handling HTTP requests and responses
-- **Python Standard Library**: Utilizes `re` for pattern matching, `json` for data serialization, `os` for environment variables, and `textwrap` for text formatting
+- **SQLite3**: Database backend for API key authentication and daily usage quota tracking
+- **Python Standard Library**: Utilizes `re` for pattern matching, `json` for data serialization, `os` for environment variables, `datetime` for quota management, and `textwrap` for text formatting
 
 ## Runtime Environment
 - **Python 3.x**: Runtime environment for the application
