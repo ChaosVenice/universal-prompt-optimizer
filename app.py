@@ -115,6 +115,22 @@ def bootstrap_demo_key():
         if not cur.fetchone():
             upsert_key("demo123", "demo@example.com", "demo", 50, None, "active", "Bootstrap demo key")
 
+def _init_share_table():
+    """Initialize the shares table for shareable links"""
+    with app.app_context():
+        db = get_db()
+        db.execute("""CREATE TABLE IF NOT EXISTS shares(
+            token TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            title TEXT,
+            meta_json TEXT NOT NULL,      -- JSON blob of images + params
+            expires_at TEXT               -- ISO date or NULL
+        )""")
+        db.commit()
+
+def _new_token(prefix="sh_"): 
+    return prefix + secrets.token_urlsafe(16)
+
 def _today():
     return datetime.date.today().isoformat()
 
@@ -465,6 +481,92 @@ async function checkout(){
 @app.get("/buy")
 def buy_page():
     return BUY_HTML
+
+# --- SHARE ENDPOINTS ---
+@app.post("/share/create")
+@require_api_key
+def share_create():
+    """
+    Body: { title?, images: [urls], params: {...}, days_valid?: 30 }
+    Returns: { url, token }
+    """
+    data = request.get_json(force=True)
+    images = data.get("images") or []
+    params = data.get("params") or {}
+    if not images: return jsonify({"error":"No images"}), 400
+    days = int(data.get("days_valid", 30))
+    token = _new_token()
+    payload = {
+        "images": images,
+        "params": params,
+    }
+    db = get_db()
+    db.execute(
+        "INSERT INTO shares(token,created_at,title,meta_json,expires_at) VALUES(?,?,?,?,?)",
+        (
+            token,
+            datetime.datetime.utcnow().isoformat(),
+            (data.get("title") or "").strip(),
+            json.dumps(payload),
+            (datetime.date.today() + datetime.timedelta(days=days)).isoformat()
+        )
+    )
+    db.commit()
+    base = os.getenv("PUBLIC_BASE_URL", "")
+    url = f"{base}/s/{token}" if base else f"/s/{token}"
+    return jsonify({ "ok": True, "url": url, "token": token })
+
+@app.get("/s/<token>")
+def share_view(token):
+    db = get_db()
+    cur = db.execute("SELECT title, meta_json, expires_at, created_at FROM shares WHERE token=?", (token,))
+    row = cur.fetchone()
+    if not row: return Response("Not found", 404)
+    title, meta_json, expires_at, created_at = row
+    if expires_at:
+        try:
+            if datetime.date.fromisoformat(expires_at) < datetime.date.today():
+                return Response("Link expired", 410)
+        except:
+            pass
+    try:
+        meta = json.loads(meta_json)
+    except:
+        return Response("Corrupt share data", 500)
+
+    # Simple public HTML (no auth)
+    imgs = "".join([f'<img src="{u}" style="max-width:100%;border-radius:10px;border:1px solid #1f2a3a;margin:6px 0">' for u in meta.get("images",[])])
+    params = json.dumps(meta.get("params",{}), indent=2)
+    ttl = (title or "Shared Generation")
+    html = f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{ttl}</title>
+<style>
+body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#0b0f14;color:#e7edf5;margin:0}}
+.wrap{{max-width:900px;margin:36px auto;padding:0 16px}}
+.card{{background:#111826;border:1px solid #1f2a3a;border-radius:14px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.25);margin-bottom:16px}}
+pre{{white-space:pre-wrap;background:#0f141c;border:1px solid #1f2a3a;padding:12px;border-radius:10px;overflow:auto}}
+small{{color:#9fb2c7}}
+a.btn{{display:inline-block;padding:10px 14px;background:#2f6df6;border-radius:10px;color:#fff;text-decoration:none}}
+</style></head><body>
+<div class="wrap">
+  <h1>{ttl}</h1>
+  <div class="card"><small>Created: {created_at} UTC</small></div>
+  <div class="card">{imgs}</div>
+  <div class="card"><h3>Parameters</h3><pre>{params}</pre></div>
+</div></body></html>"""
+    return Response(html, 200, mimetype="text/html")
+
+@app.post("/share/delete")
+@require_api_key
+def share_delete():
+    data = request.get_json(force=True)
+    token = (data.get("token") or "").strip()
+    if not token: return jsonify({"error":"Missing token"}), 400
+    db = get_db()
+    db.execute("DELETE FROM shares WHERE token=?", (token,))
+    db.commit()
+    return jsonify({"ok": True})
 
 # ---------------------------
 # Prompt Enhancement Engine
@@ -825,6 +927,7 @@ h3{margin:8px 0}select, input[type="text"] {height:40px}textarea {min-height:110
         <button onclick="downloadText('sdxl.json','sdxlBox')">Download JSON</button>
         <button class="secondary" id="genComfyBtn" onclick="generateComfyAsync()">Generate (ComfyUI)</button>
         <button class="secondary" id="zipBtn" style="display:none" onclick="downloadZip(LAST_IMAGES)">Download ZIP</button>
+        <button class="secondary" id="shareBtn" style="display:none" onclick="shareCurrent()">Share Link</button>
       </div>
       <div id="sdxlBox" class="box section kv"></div>
 
@@ -977,7 +1080,8 @@ function renderHistory(){
     const rerun=document.createElement('button'); rerun.className='secondary'; rerun.textContent='Re-run'; rerun.onclick=()=>reRun(h);
     const dl=document.createElement('button'); dl.className='secondary'; dl.textContent='Download All'; dl.onclick=()=>downloadAll(h.images||[]);
     const zip=document.createElement('button'); zip.className='secondary'; zip.textContent='ZIP'; zip.onclick=()=>downloadZip(h.images||[]);
-    btns.appendChild(rerun); btns.appendChild(dl); btns.appendChild(zip);
+    const shareBtn = document.createElement('button'); shareBtn.className = 'secondary'; shareBtn.textContent = 'Share'; shareBtn.onclick = ()=>shareHistory(h);
+    btns.appendChild(rerun); btns.appendChild(dl); btns.appendChild(zip); btns.appendChild(shareBtn);
     div.appendChild(img); div.appendChild(meta); div.appendChild(btns); grid.appendChild(div);
   });
 }
@@ -1026,6 +1130,59 @@ function copyText(id){ const el=document.getElementById(id); const txt=el?.inner
 function downloadText(filename,id){ const el=document.getElementById(id); const txt=el?.innerText||el?.textContent||''; const blob=new Blob([txt],{type:'text/plain'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=filename; a.click(); setTimeout(()=>URL.revokeObjectURL(url),1000); }
 async function downloadZip(urls){ if(!urls||!urls.length){alert('No images to zip.');return;} const res=await fetch('/zip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({urls})}); if(!res.ok){alert('ZIP failed.');return;} const blob=await res.blob(); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='upo_outputs.zip'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); }
 
+// Share functions
+function copy(text){ navigator.clipboard.writeText(text); alert('Link copied to clipboard'); }
+
+async function createShare(meta){
+  const s = JSON.parse(localStorage.getItem('upo_settings_v1') || '{}');
+  if(!s.apiKey){ alert('Enter your API key in Settings.'); return null; }
+  const res = await fetch('/share/create', {
+    method:'POST',
+    headers:{'Content-Type':'application/json','X-API-Key': s.apiKey},
+    body: JSON.stringify(meta)
+  });
+  const out = await res.json();
+  if(!res.ok){ alert(out.error || 'Share failed'); return null; }
+  return out.url;
+}
+
+async function shareCurrent(){
+  if(!LAST_IMAGES || !LAST_IMAGES.length){ alert('No images to share'); return; }
+  const f = getForm();
+  const meta = {
+    title: f.idea || 'Shared Generation',
+    images: LAST_IMAGES,
+    params: {
+      steps: f.steps || undefined,
+      cfg_scale: f.cfg_scale || undefined,
+      sampler: f.sampler || undefined,
+      seed: f.seed || undefined,
+      batch: f.batch || undefined,
+      aspect_ratio: f.aspect_ratio || undefined,
+      lighting: f.lighting || undefined,
+      color_grade: f.color_grade || undefined,
+      extra_tags: f.extra_tags || undefined
+    }
+  };
+  const url = await createShare(meta);
+  if(url){ copy(url); }
+}
+
+async function shareHistory(h){
+  const meta = {
+    title: h.idea || 'Shared Generation',
+    images: h.images || [],
+    params: {
+      steps: h.steps, cfg_scale: h.cfg_scale, sampler: h.sampler,
+      seed: h.seed, batch: h.batch, width: h.width, height: h.height,
+      aspect_ratio: h.aspect_ratio, lighting: h.lighting,
+      color_grade: h.color_grade, extra_tags: h.extra_tags
+    }
+  };
+  const url = await createShare(meta);
+  if(url){ copy(url); }
+}
+
 async function optimize(){
   const payload=getForm();
   const res=await fetch('/optimize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
@@ -1041,7 +1198,7 @@ async function optimize(){
   document.getElementById('hintsBox').textContent=JSON.stringify(out.hints,null,2);
   const s=JSON.parse(localStorage.getItem(LS_SETTINGS)||'{}');
   document.getElementById('genComfyBtn').style.display=s.host?'inline-block':'none';
-  document.getElementById('genImages').innerHTML=''; document.getElementById('zipBtn').style.display='none';
+  document.getElementById('genImages').innerHTML=''; document.getElementById('zipBtn').style.display='none'; document.getElementById('shareBtn').style.display='none';
   hideProgress();
 }
 document.getElementById('run').addEventListener('click', optimize);
@@ -1087,7 +1244,7 @@ async function pollStatus(){
       clearInterval(POLL); POLL=null; hideProgress();
       LAST_IMAGES=found; const wrap=document.getElementById('genImages'); wrap.innerHTML='';
       found.forEach(url=>{const img=document.createElement('img'); img.src=url; img.alt='Generated image'; img.loading='lazy'; wrap.appendChild(img);});
-      document.getElementById('zipBtn').style.display='inline-block';
+      document.getElementById('zipBtn').style.display='inline-block'; document.getElementById('shareBtn').style.display='inline-block';
       
       // Charge usage
       try{
@@ -1478,6 +1635,7 @@ def create_zip():
 
 # Create demo key on startup
 bootstrap_demo_key()
+_init_share_table()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)

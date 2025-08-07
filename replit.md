@@ -68,6 +68,7 @@ The service provides comprehensive endpoints for prompt optimization and image g
 - **Authentication System** (`/auth/check`, `/usage`, `/usage/charge`): Database-backed API key validation with expiry dates, individual daily quota tracking, and usage management
 - **Stripe Integration** (`/stripe/webhook`): Automated API key provisioning for checkout completions and subscription payments with configurable plan mapping and email notifications
 - **Checkout System** (`/checkout/create`, `/buy`): Stripe Checkout integration with dedicated buy page for seamless payment flow and instant API key delivery
+- **Shareable Links** (`/share/create`, `/s/<token>`, `/share/delete`): Public link generation for sharing generations with expiry dates and parameter display
 - **Admin Management** (`/admin/issue`, `/admin/revoke`, `/admin/update_limit`, `/admin/keys`): Manual API key operations for customer support and key lifecycle management
 - **Status Polling** (`/generate/comfy_status`): Real-time generation progress tracking for async workflows with authentication
 - **ZIP Downloads** (`/zip`): Bulk image packaging accepting image URLs and returning compressed archives
@@ -77,6 +78,7 @@ The service provides comprehensive endpoints for prompt optimization and image g
 - **Progress Tracking**: Real-time progress bars with cancellation capabilities for long-running operations
 - **Individual Quotas**: Per-key daily generation limits with automatic usage charging and remaining quota display
 - **Key Management**: Database-backed keys with email association, plan tiers, expiry dates, and revocation capabilities
+- **Shareable Links**: Public link generation for any generation with 30-day expiry, automatic clipboard copy, and parameter display
 - **Bootstrap Demo**: Auto-created demo123 key with 50 daily generations for immediate testing
 - **Error Handling**: Comprehensive validation with loading states and user-friendly error messages
 - **Execution Hints**: Built-in troubleshooting guidance for common generation issues (faces, motion warping, busy outputs)
