@@ -222,12 +222,14 @@ h1{margin:0 0 6px;font-size:28px}.sub{margin:0 0 18px;color:#9fb2c7}
 label{display:block;font-size:14px;color:#a9bdd4;margin-bottom:6px}
 textarea,input,select{width:100%;padding:10px 12px;border-radius:10px;border:1px solid #243447;background:#0f141c;color:#e7edf5}
 textarea::placeholder,input::placeholder{color:#627a91}.row{display:flex;gap:12px;margin-top:12px}.col{flex:1}
-button{margin-top:14px;padding:12px 16px;background:#2f6df6;border:none;border-radius:10px;color:#fff;font-weight:600;cursor:pointer}
+button{margin-top:14px;padding:10px 14px;background:#2f6df6;border:none;border-radius:10px;color:#fff;font-weight:600;cursor:pointer}
 button:hover{filter:brightness(1.05)}.results{margin-top:22px}.hidden{display:none}
-#json{white-space:pre-wrap;background:#0f141c;border:1px solid #1f2a3a;padding:12px;border-radius:10px}
-.small{font-size:12px;color:#7f93a7}
-.badge{display:inline-block;padding:4px 8px;border:1px solid #2d3b4e;border-radius:999px;margin-right:6px;color:#a9bdd4}
+.box{background:#0f141c;border:1px solid #1f2a3a;padding:12px;border-radius:10px;white-space:pre-wrap}
+.section{margin-top:14px}.rowbtns{display:flex;gap:8px;flex-wrap:wrap}
+.kv{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;color:#bcd0e3}
+.small{font-size:12px;color:#7f93a7}.badge{display:inline-block;padding:4px 8px;border:1px solid #2d3b4e;border-radius:999px;margin-right:6px;color:#a9bdd4}
 footer{margin-top:24px;text-align:center;color:#6f859c;font-size:12px}
+h3{margin:8px 0}
 </style>
 </head>
 <body>
@@ -286,14 +288,75 @@ footer{margin-top:24px;text-align:center;color:#6f859c;font-size:12px}
 
   <div id="results" class="results hidden">
     <div class="card">
-      <h3>Optimized Output</h3>
-      <div id="json"></div>
+      <h3>Unified Prompt</h3>
+      <div class="rowbtns">
+        <button onclick="copyText('unifiedPos')">Copy Positive</button>
+        <button onclick="copyText('unifiedNeg')">Copy Negative</button>
+        <button onclick="downloadText('unified_positive.txt','unifiedPos')">Download .txt (Positive)</button>
+        <button onclick="downloadText('unified_negative.txt','unifiedNeg')">Download .txt (Negative)</button>
+      </div>
+      <div id="unifiedPos" class="box section"></div>
+      <div id="unifiedNeg" class="box section"></div>
+
+      <h3>SDXL</h3>
+      <div class="rowbtns">
+        <button onclick="copyText('sdxlBox')">Copy JSON</button>
+        <button onclick="downloadText('sdxl.json','sdxlBox')">Download JSON</button>
+      </div>
+      <div id="sdxlBox" class="box section kv"></div>
+
+      <h3>ComfyUI</h3>
+      <div class="rowbtns">
+        <button onclick="copyText('comfyBox')">Copy JSON</button>
+        <button onclick="downloadText('comfyui.json','comfyBox')">Download JSON</button>
+      </div>
+      <div id="comfyBox" class="box section kv"></div>
+
+      <h3>Midjourney</h3>
+      <div class="rowbtns">
+        <button onclick="copyText('mjBox')">Copy Prompt</button>
+        <button onclick="downloadText('midjourney.txt','mjBox')">Download .txt</button>
+      </div>
+      <div id="mjBox" class="box section kv"></div>
+
+      <h3>Pika</h3>
+      <div class="rowbtns">
+        <button onclick="copyText('pikaBox')">Copy JSON</button>
+        <button onclick="downloadText('pika.json','pikaBox')">Download JSON</button>
+      </div>
+      <div id="pikaBox" class="box section kv"></div>
+
+      <h3>Runway</h3>
+      <div class="rowbtns">
+        <button onclick="copyText('runwayBox')">Copy JSON</button>
+        <button onclick="downloadText('runway.json','runwayBox')">Download JSON</button>
+      </div>
+      <div id="runwayBox" class="box section kv"></div>
+
+      <h3>Hints</h3>
+      <div id="hintsBox" class="box section small"></div>
     </div>
   </div>
 
   <footer>Seed tip: lock a seed for reproducibility; vary only seed to explore variants without wrecking the look.</footer>
 </div>
 <script>
+function copyText(id){
+  const el = document.getElementById(id);
+  const txt = el?.innerText || el?.textContent || '';
+  navigator.clipboard.writeText(txt);
+}
+
+function downloadText(filename, id){
+  const el = document.getElementById(id);
+  const txt = el?.innerText || el?.textContent || '';
+  const blob = new Blob([txt], {type: 'text/plain'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  setTimeout(()=>URL.revokeObjectURL(url), 1000);
+}
+
 async function optimize(){
   const payload = {
     idea: document.getElementById('idea').value.trim(),
@@ -309,7 +372,20 @@ async function optimize(){
   });
   const out = await res.json();
   document.getElementById('results').classList.remove('hidden');
-  document.getElementById('json').textContent = JSON.stringify(out, null, 2);
+
+  // Render unified prompts
+  document.getElementById('unifiedPos').textContent = out.unified?.positive || '';
+  document.getElementById('unifiedNeg').textContent = out.unified?.negative || '';
+
+  // Render model-specific
+  document.getElementById('sdxlBox').textContent   = JSON.stringify(out.sdxl, null, 2);
+  document.getElementById('comfyBox').textContent  = JSON.stringify(out.comfyui, null, 2);
+  document.getElementById('mjBox').textContent     = out.midjourney || '';
+  document.getElementById('pikaBox').textContent   = JSON.stringify(out.pika, null, 2);
+  document.getElementById('runwayBox').textContent = JSON.stringify(out.runway, null, 2);
+
+  // Hints
+  document.getElementById('hintsBox').textContent  = JSON.stringify(out.hints, null, 2);
 }
 document.getElementById('run').addEventListener('click', optimize);
 </script>
