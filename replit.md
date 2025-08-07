@@ -32,11 +32,15 @@ The application includes a comprehensive negative prompting system that automati
 Environment-based configuration is implemented for sensitive settings like session secrets, with fallback defaults for development environments. This ensures security in production while maintaining ease of development.
 
 ## API Structure
-The service provides two endpoints:
+The service provides comprehensive endpoints for prompt optimization and image generation:
 
-- **Web Interface** (`/`): Interactive dark-themed UI with form inputs for idea, negative prompts, aspect ratios, and optional enhancements
-- **Direct API** (`/api/optimize`): JSON-only endpoint accepting `{idea, negative, aspect_ratio}` and returning complete platform configurations
-- **Response Format**: Returns unified prompts plus platform-specific configurations (SDXL settings, ComfyUI node hints, Midjourney flags, video motion parameters)
+- **Web Interface** (`/`): Interactive dark-themed UI with advanced controls, presets, and complete history management
+- **Optimization API** (`/optimize`, `/api/optimize`): JSON endpoints accepting `{idea, negative, aspect_ratio, lighting, color_grade, extra_tags}` and returning complete platform configurations
+- **ComfyUI Generation** (`/generate/comfy`): Direct image generation with parameter overrides and workflow customization
+- **ZIP Downloads** (`/zip`): Bulk image packaging accepting image URLs and returning compressed archives
+- **Response Format**: Returns unified prompts plus platform-specific configurations (SDXL settings, ComfyUI workflows, Midjourney flags, video motion parameters)
+- **Advanced Controls**: Steps, CFG scale, sampler selection, seed management, and batch size controls (1-8 images)
+- **History System**: Local storage with up to 200 generation records, complete with re-run capabilities and bulk downloads
 - **Error Handling**: Comprehensive validation with loading states and user-friendly error messages
 - **Execution Hints**: Built-in troubleshooting guidance for common generation issues (faces, motion warping, busy outputs)
 
