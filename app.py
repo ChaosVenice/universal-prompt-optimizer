@@ -126,10 +126,55 @@ def _init_share_table():
             meta_json TEXT NOT NULL,      -- JSON blob of images + params
             expires_at TEXT               -- ISO date or NULL
         )""")
+        # Lead capture table
+        db.execute("""CREATE TABLE IF NOT EXISTS leads(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL,
+            share_token TEXT,
+            ip_address TEXT,
+            created_at TEXT NOT NULL,
+            source TEXT DEFAULT 'share_download'
+        )""")
+        # Analytics tracking table
+        db.execute("""CREATE TABLE IF NOT EXISTS share_visits(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            share_token TEXT NOT NULL,
+            ip_address TEXT,
+            user_agent TEXT,
+            referrer TEXT,
+            visited_at TEXT NOT NULL
+        )""")
         db.commit()
 
 def _new_token(prefix="sh_"): 
     return prefix + secrets.token_urlsafe(16)
+
+def _get_client_ip():
+    """Get client IP address handling proxies"""
+    forwarded = request.headers.get('X-Forwarded-For')
+    if forwarded:
+        return forwarded.split(',')[0].strip()
+    real_ip = request.headers.get('X-Real-IP')
+    if real_ip:
+        return real_ip
+    return request.remote_addr or 'unknown'
+
+def _track_share_visit(share_token):
+    """Track analytics for share page visits"""
+    db = get_db()
+    db.execute("""INSERT INTO share_visits(share_token, ip_address, user_agent, referrer, visited_at)
+                  VALUES(?,?,?,?,?)""",
+               (share_token, _get_client_ip(), request.headers.get('User-Agent', ''),
+                request.headers.get('Referer', ''), datetime.datetime.utcnow().isoformat()))
+    db.commit()
+
+def _capture_lead(email, share_token=None, source='share_download'):
+    """Capture lead information"""
+    db = get_db()
+    db.execute("""INSERT INTO leads(email, share_token, ip_address, created_at, source)
+                  VALUES(?,?,?,?,?)""",
+               (email, share_token, _get_client_ip(), datetime.datetime.utcnow().isoformat(), source))
+    db.commit()
 
 def _today():
     return datetime.date.today().isoformat()
@@ -372,6 +417,58 @@ def admin_keys():
         })
     return jsonify({"keys": items})
 
+@app.get("/admin/leads")
+@require_admin
+def admin_leads():
+    """View captured leads from share pages"""
+    db = get_db()
+    cur = db.execute("""SELECT id, email, share_token, ip_address, created_at, source 
+                        FROM leads ORDER BY created_at DESC LIMIT 500""")
+    rows = cur.fetchall()
+    leads = []
+    for r in rows:
+        leads.append({
+            "id": r[0], "email": r[1], "share_token": r[2], 
+            "ip_address": r[3], "created_at": r[4], "source": r[5]
+        })
+    return jsonify({"leads": leads, "total": len(leads)})
+
+@app.get("/admin/analytics")
+@require_admin
+def admin_analytics():
+    """View share page analytics"""
+    db = get_db()
+    
+    # Recent visits
+    cur = db.execute("""SELECT share_token, ip_address, user_agent, referrer, visited_at 
+                        FROM share_visits ORDER BY visited_at DESC LIMIT 200""")
+    visits = []
+    for r in cur.fetchall():
+        visits.append({
+            "share_token": r[0], "ip_address": r[1], "user_agent": r[2],
+            "referrer": r[3], "visited_at": r[4]
+        })
+    
+    # Visit counts by token
+    cur = db.execute("""SELECT share_token, COUNT(*) as visit_count 
+                        FROM share_visits GROUP BY share_token ORDER BY visit_count DESC LIMIT 50""")
+    popular_shares = []
+    for r in cur.fetchall():
+        popular_shares.append({"share_token": r[0], "visits": r[1]})
+    
+    # Daily visit stats
+    cur = db.execute("""SELECT DATE(visited_at) as visit_date, COUNT(*) as daily_visits 
+                        FROM share_visits GROUP BY DATE(visited_at) ORDER BY visit_date DESC LIMIT 30""")
+    daily_stats = []
+    for r in cur.fetchall():
+        daily_stats.append({"date": r[0], "visits": r[1]})
+    
+    return jsonify({
+        "recent_visits": visits,
+        "popular_shares": popular_shares,
+        "daily_stats": daily_stats
+    })
+
 # --- CHECKOUT + BUY PAGE ---
 @app.post("/checkout/create")
 def checkout_create():
@@ -518,6 +615,9 @@ def share_create():
 
 @app.get("/s/<token>")
 def share_view(token):
+    # Track analytics
+    _track_share_visit(token)
+    
     db = get_db()
     cur = db.execute("SELECT title, meta_json, expires_at, created_at FROM shares WHERE token=?", (token,))
     row = cur.fetchone()
@@ -534,27 +634,161 @@ def share_view(token):
     except:
         return Response("Corrupt share data", 500)
 
-    # Simple public HTML (no auth)
-    imgs = "".join([f'<img src="{u}" style="max-width:100%;border-radius:10px;border:1px solid #1f2a3a;margin:6px 0">' for u in meta.get("images",[])])
+    # Build branded marketing funnel page
+    imgs = "".join([f'<img src="{u}" style="max-width:100%;border-radius:10px;border:2px solid #1f2a3a;margin:8px 0;box-shadow:0 4px 20px rgba(0,255,255,0.1)">' for u in meta.get("images",[])])
     params = json.dumps(meta.get("params",{}), indent=2)
     ttl = (title or "Shared Generation")
+    
+    # Create email body for order request (URL encoded)
+    import urllib.parse
+    order_params = "\n".join([f"{k}: {v}" for k,v in meta.get("params",{}).items() if v])
+    order_subject = urllib.parse.quote(f"Order Similar Image Pack - {ttl}")
+    order_body = urllib.parse.quote(f"""Hi Chaos Venice Productions,
+
+I'd like to order a similar image pack based on this generation:
+
+Title: {ttl}
+Parameters:
+{order_params}
+
+Please let me know pricing and delivery time.
+
+Best regards""")
+
     html = f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{ttl}</title>
+<title>{ttl} - Chaos Venice Productions</title>
 <style>
-body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#0b0f14;color:#e7edf5;margin:0}}
-.wrap{{max-width:900px;margin:36px auto;padding:0 16px}}
-.card{{background:#111826;border:1px solid #1f2a3a;border-radius:14px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.25);margin-bottom:16px}}
-pre{{white-space:pre-wrap;background:#0f141c;border:1px solid #1f2a3a;padding:12px;border-radius:10px;overflow:auto}}
+body{{font-family:'Inter',system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:linear-gradient(135deg,#0a0e1a 0%,#0f1419 50%,#1a1f2e 100%);color:#e7edf5;margin:0;min-height:100vh}}
+.wrap{{max-width:1000px;margin:0 auto;padding:20px}}
+.header{{text-align:center;margin-bottom:40px;padding:30px 20px;background:linear-gradient(45deg,rgba(0,255,255,0.1),rgba(255,0,255,0.1));border-radius:20px;border:1px solid #1f2a3a}}
+.logo{{font-size:2.5rem;font-weight:800;background:linear-gradient(45deg,#00ffff,#ff00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:10px}}
+.tagline{{font-size:1.1rem;color:#9fb2c7;font-style:italic}}
+.card{{background:rgba(17,24,38,0.8);border:1px solid #1f2a3a;border-radius:16px;padding:24px;box-shadow:0 10px 40px rgba(0,0,0,.4);margin-bottom:24px;backdrop-filter:blur(10px)}}
+.images-section img{{transition:transform 0.3s ease;cursor:pointer}}
+.images-section img:hover{{transform:scale(1.02)}}
+.cta-section{{background:linear-gradient(135deg,rgba(0,255,255,0.1),rgba(255,0,255,0.1));border:2px solid transparent;background-clip:padding-box}}
+.cta-grid{{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px}}
+@media(max-width:768px){{.cta-grid{{grid-template-columns:1fr}}}}
+.btn{{display:inline-block;padding:16px 24px;background:linear-gradient(45deg,#00ffff,#ff00ff);border-radius:12px;color:#000;text-decoration:none;font-weight:600;text-align:center;transition:all 0.3s ease;box-shadow:0 4px 20px rgba(0,255,255,0.3)}}
+.btn:hover{{transform:translateY(-2px);box-shadow:0 8px 30px rgba(0,255,255,0.5)}}
+.btn-secondary{{background:linear-gradient(45deg,#1a1f2e,#2a2f3e);color:#e7edf5;box-shadow:0 4px 20px rgba(255,255,255,0.1)}}
+.btn-secondary:hover{{box-shadow:0 8px 30px rgba(255,255,255,0.2)}}
+.lead-form{{background:rgba(0,0,0,0.3);padding:20px;border-radius:12px;margin-top:20px}}
+.form-group{{margin-bottom:15px}}
+.form-group input{{width:100%;padding:12px;background:rgba(255,255,255,0.1);border:1px solid #1f2a3a;border-radius:8px;color:#e7edf5;font-size:16px}}
+.form-group input::placeholder{{color:#9fb2c7}}
+pre{{white-space:pre-wrap;background:#0f141c;border:1px solid #1f2a3a;padding:16px;border-radius:12px;overflow:auto;font-family:'JetBrains Mono',monospace}}
 small{{color:#9fb2c7}}
-a.btn{{display:inline-block;padding:10px 14px;background:#2f6df6;border-radius:10px;color:#fff;text-decoration:none}}
+.download-section{{text-align:center;margin-top:20px}}
+.success-message{{background:rgba(0,255,0,0.1);border:1px solid rgba(0,255,0,0.3);padding:15px;border-radius:8px;margin-top:15px;display:none}}
+.footer{{text-align:center;margin-top:40px;padding:20px;border-top:1px solid #1f2a3a;color:#9fb2c7}}
 </style></head><body>
 <div class="wrap">
-  <h1>{ttl}</h1>
-  <div class="card"><small>Created: {created_at} UTC</small></div>
-  <div class="card">{imgs}</div>
-  <div class="card"><h3>Parameters</h3><pre>{params}</pre></div>
-</div></body></html>"""
+  <!-- Header/Branding -->
+  <div class="header">
+    <div class="logo">CHAOS VENICE PRODUCTIONS</div>
+    <div class="tagline">Where Imagination Meets Precision</div>
+  </div>
+
+  <!-- Title -->
+  <div class="card">
+    <h1 style="margin:0;font-size:2rem;background:linear-gradient(45deg,#00ffff,#ff00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent">{ttl}</h1>
+    <small>Created: {created_at} UTC</small>
+  </div>
+
+  <!-- Images -->
+  <div class="card images-section">{imgs}</div>
+
+  <!-- CTA Section -->
+  <div class="card cta-section">
+    <h3 style="text-align:center;margin-bottom:20px;color:#00ffff">Love This Style? Get More!</h3>
+    <div class="cta-grid">
+      <a href="mailto:orders@chaosvenice.com?subject={order_subject}&body={order_body}" class="btn">📦 Order Similar Image Pack</a>
+      <a href="/contact" class="btn btn-secondary">🎨 Hire Us to Create More</a>
+    </div>
+    <div style="text-align:center;color:#9fb2c7;font-size:0.9rem">
+      Professional AI art generation • Custom workflows • Enterprise solutions
+    </div>
+
+    <!-- Lead Capture for Downloads -->
+    <div class="lead-form" id="leadForm">
+      <h4 style="margin-top:0;color:#ff00ff">Download High-Quality Images</h4>
+      <p style="margin-bottom:15px;color:#9fb2c7">Enter your email to download these images as a ZIP file:</p>
+      <div class="form-group">
+        <input type="email" id="emailInput" placeholder="your@email.com" required>
+      </div>
+      <button onclick="submitLead()" class="btn" style="width:100%">Get Download Link</button>
+      <div class="success-message" id="successMessage">
+        <p>✅ Thank you! Your download will start automatically.</p>
+        <p>We'll also send you updates about new AI art techniques and exclusive offers.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Parameters -->
+  <div class="card">
+    <h3 style="color:#00ffff">Generation Parameters</h3>
+    <pre>{params}</pre>
+  </div>
+
+  <!-- Footer -->
+  <div class="footer">
+    <p>© 2025 Chaos Venice Productions. Pushing the boundaries of AI creativity.</p>
+    <p style="font-size:0.8rem">This content was generated using our Universal Prompt Optimizer platform.</p>
+  </div>
+</div>
+
+<script>
+async function submitLead() {{
+  const email = document.getElementById('emailInput').value;
+  if (!email || !email.includes('@')) {{
+    alert('Please enter a valid email address');
+    return;
+  }}
+
+  try {{
+    const response = await fetch('/share/capture-lead', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{
+        email: email,
+        share_token: '{token}'
+      }})
+    }});
+
+    if (response.ok) {{
+      document.getElementById('leadForm').style.display = 'none';
+      document.getElementById('successMessage').style.display = 'block';
+      
+      // Trigger download
+      const images = {meta.get("images",[])};
+      if (images.length > 0) {{
+        const zipResponse = await fetch('/zip', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{urls: images}})
+        }});
+        
+        if (zipResponse.ok) {{
+          const blob = await zipResponse.blob();
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'chaos_venice_images.zip';
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+        }}
+      }}
+    }} else {{
+      alert('Error capturing email. Please try again.');
+    }}
+  }} catch (error) {{
+    alert('Network error. Please try again.');
+  }}
+}}
+</script>
+</body></html>"""
     return Response(html, 200, mimetype="text/html")
 
 @app.post("/share/delete")
@@ -567,6 +801,95 @@ def share_delete():
     db.execute("DELETE FROM shares WHERE token=?", (token,))
     db.commit()
     return jsonify({"ok": True})
+
+@app.post("/share/capture-lead")
+def share_capture_lead():
+    """Capture lead email from share page downloads"""
+    data = request.get_json(force=True)
+    email = (data.get("email") or "").strip()
+    share_token = (data.get("share_token") or "").strip()
+    
+    if not email or "@" not in email:
+        return jsonify({"error": "Valid email required"}), 400
+    
+    _capture_lead(email, share_token, "share_download")
+    return jsonify({"ok": True, "message": "Email captured successfully"})
+
+@app.get("/contact")
+def contact_page():
+    """Contact/booking page for Chaos Venice Productions"""
+    html = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Contact - Chaos Venice Productions</title>
+<style>
+body{font-family:'Inter',system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:linear-gradient(135deg,#0a0e1a 0%,#0f1419 50%,#1a1f2e 100%);color:#e7edf5;margin:0;min-height:100vh}
+.wrap{max-width:800px;margin:0 auto;padding:20px}
+.header{text-align:center;margin-bottom:40px;padding:30px 20px;background:linear-gradient(45deg,rgba(0,255,255,0.1),rgba(255,0,255,0.1));border-radius:20px;border:1px solid #1f2a3a}
+.logo{font-size:2.5rem;font-weight:800;background:linear-gradient(45deg,#00ffff,#ff00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:10px}
+.tagline{font-size:1.1rem;color:#9fb2c7;font-style:italic}
+.card{background:rgba(17,24,38,0.8);border:1px solid #1f2a3a;border-radius:16px;padding:24px;box-shadow:0 10px 40px rgba(0,0,0,.4);margin-bottom:24px;backdrop-filter:blur(10px)}
+.contact-grid{display:grid;grid-template-columns:1fr 1fr;gap:30px;margin-top:30px}
+@media(max-width:768px){.contact-grid{grid-template-columns:1fr}}
+.contact-method{text-align:center;padding:20px;background:rgba(0,0,0,0.3);border-radius:12px;border:1px solid #1f2a3a}
+.contact-method h3{color:#00ffff;margin-bottom:10px}
+.contact-method a{color:#ff00ff;text-decoration:none;font-weight:600}
+.contact-method a:hover{text-decoration:underline}
+.services{margin-top:30px}
+.service-item{padding:15px;margin-bottom:15px;background:rgba(0,255,255,0.05);border-left:3px solid #00ffff;border-radius:8px}
+</style></head><body>
+<div class="wrap">
+  <div class="header">
+    <div class="logo">CHAOS VENICE PRODUCTIONS</div>
+    <div class="tagline">Where Imagination Meets Precision</div>
+  </div>
+  
+  <div class="card">
+    <h1 style="text-align:center;background:linear-gradient(45deg,#00ffff,#ff00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent">Let's Create Something Amazing</h1>
+    <p style="text-align:center;color:#9fb2c7;font-size:1.1rem">Ready to bring your creative vision to life? We specialize in cutting-edge AI art generation and custom creative solutions.</p>
+    
+    <div class="contact-grid">
+      <div class="contact-method">
+        <h3>📧 Email Us</h3>
+        <p><a href="mailto:orders@chaosvenice.com">orders@chaosvenice.com</a></p>
+        <p style="color:#9fb2c7;font-size:0.9rem">For project inquiries and custom orders</p>
+      </div>
+      
+      <div class="contact-method">
+        <h3>💼 Business Inquiries</h3>
+        <p><a href="mailto:business@chaosvenice.com">business@chaosvenice.com</a></p>
+        <p style="color:#9fb2c7;font-size:0.9rem">Enterprise solutions and partnerships</p>
+      </div>
+    </div>
+  </div>
+  
+  <div class="card services">
+    <h2 style="color:#00ffff;text-align:center">Our Services</h2>
+    <div class="service-item">
+      <h3 style="color:#ff00ff">Custom AI Art Generation</h3>
+      <p>Bespoke image creation using advanced AI models and custom workflows</p>
+    </div>
+    <div class="service-item">
+      <h3 style="color:#ff00ff">Brand Asset Creation</h3>
+      <p>Logo design, marketing materials, and complete brand identity packages</p>
+    </div>
+    <div class="service-item">
+      <h3 style="color:#ff00ff">Enterprise Solutions</h3>
+      <p>Large-scale content generation, API integration, and custom platform development</p>
+    </div>
+    <div class="service-item">
+      <h3 style="color:#ff00ff">Creative Consulting</h3>
+      <p>Guidance on AI art workflows, prompt engineering, and creative strategy</p>
+    </div>
+  </div>
+  
+  <div class="card" style="text-align:center">
+    <h3 style="color:#00ffff">Ready to Start?</h3>
+    <p style="margin-bottom:20px">Tell us about your project and we'll get back to you within 24 hours.</p>
+    <a href="mailto:orders@chaosvenice.com?subject=New Project Inquiry" style="display:inline-block;padding:16px 32px;background:linear-gradient(45deg,#00ffff,#ff00ff);border-radius:12px;color:#000;text-decoration:none;font-weight:600">Start a Project</a>
+  </div>
+</div>
+</body></html>"""
+    return Response(html, 200, mimetype="text/html")
 
 # ---------------------------
 # Prompt Enhancement Engine

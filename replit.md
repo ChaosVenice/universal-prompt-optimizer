@@ -34,11 +34,17 @@ Environment-based configuration is implemented for sensitive settings like sessi
 ### Required Environment Variables
 - **SESSION_SECRET**: Flask session security key
 - **USAGE_DB**: SQLite database path (defaults to "usage.db")
-- **ADMIN_TOKEN**: Admin authentication token for management endpoints
+- **ADMIN_TOKEN**: Admin authentication token for management endpoints (required for /admin/* routes)
 - **STRIPE_API_KEY**: Stripe API key for payment processing (optional)
 - **STRIPE_WEBHOOK_SECRET**: Stripe webhook signing secret (optional)
 - **PUBLIC_BASE_URL**: Base URL for success/cancel redirects (e.g., "https://your-app.onreplit.app")
 - **FROM_EMAIL**: Email address for sending API keys to customers
+
+### Marketing Funnel Configuration
+- All share pages now function as branded marketing funnels for "Chaos Venice Productions"
+- Lead capture emails are stored in SQLite `leads` table with IP tracking
+- Share page visits are tracked in `share_visits` table for analytics
+- Email integration supports both SendGrid and SMTP for lead notifications
 
 ### Email Configuration (choose one)
 **SendGrid (recommended):**
@@ -68,8 +74,9 @@ The service provides comprehensive endpoints for prompt optimization and image g
 - **Authentication System** (`/auth/check`, `/usage`, `/usage/charge`): Database-backed API key validation with expiry dates, individual daily quota tracking, and usage management
 - **Stripe Integration** (`/stripe/webhook`): Automated API key provisioning for checkout completions and subscription payments with configurable plan mapping and email notifications
 - **Checkout System** (`/checkout/create`, `/buy`): Stripe Checkout integration with dedicated buy page for seamless payment flow and instant API key delivery
-- **Shareable Links** (`/share/create`, `/s/<token>`, `/share/delete`): Public link generation for sharing generations with expiry dates and parameter display
-- **Admin Management** (`/admin/issue`, `/admin/revoke`, `/admin/update_limit`, `/admin/keys`): Manual API key operations for customer support and key lifecycle management
+- **Shareable Links** (`/share/create`, `/s/<token>`, `/share/delete`): Branded marketing funnels for Chaos Venice Productions with lead capture, analytics tracking, and monetization hooks
+- **Marketing Funnels** (`/share/capture-lead`, `/contact`): Lead capture system and professional contact pages with Chaos Venice branding
+- **Admin Management** (`/admin/issue`, `/admin/revoke`, `/admin/update_limit`, `/admin/keys`, `/admin/leads`, `/admin/analytics`): Manual API key operations, lead management, and share page analytics
 - **Status Polling** (`/generate/comfy_status`): Real-time generation progress tracking for async workflows with authentication
 - **ZIP Downloads** (`/zip`): Bulk image packaging accepting image URLs and returning compressed archives
 - **Response Format**: Returns unified prompts plus platform-specific configurations (SDXL settings, ComfyUI workflows, Midjourney flags, video motion parameters)
