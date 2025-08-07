@@ -10,22 +10,15 @@ from textwrap import dedent
 import random
 import sqlite3
 import datetime
-from flask import Flask, request, jsonify, Response, g
+import secrets
+from functools import wraps
+from flask import Flask, request, jsonify, Response, g, abort
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SESSION_SECRET")
 
-# ---------------------------
-# Authentication & Quota System
-# ---------------------------
-
-# ENV VARS:
-#   VALID_KEYS: comma-separated list of allowed keys, e.g. "demo123,pro456"
-#   DAILY_LIMIT: integer, default 50
-VALID_KEYS = {k.strip() for k in (os.getenv("VALID_KEYS","demo123").split(","))}
-DAILY_LIMIT = int(os.getenv("DAILY_LIMIT","50"))
-
-DB_PATH = os.getenv("USAGE_DB","usage.db")
+# --- API key storage + helpers ---
+DB_PATH = os.getenv("USAGE_DB", "usage.db")
 
 def get_db():
     if "db" not in g:
@@ -36,12 +29,30 @@ def get_db():
             count INTEGER NOT NULL,
             PRIMARY KEY (key, day)
         )""")
+        g.db.execute("""CREATE TABLE IF NOT EXISTS api_keys (
+            key TEXT PRIMARY KEY,
+            email TEXT,
+            plan TEXT,
+            daily_limit INTEGER NOT NULL,
+            expires_at TEXT,          -- ISO date (YYYY-MM-DD) or NULL
+            status TEXT NOT NULL,     -- 'active' | 'revoked'
+            notes TEXT,
+            created_at TEXT NOT NULL  -- ISO datetime
+        )""")
     return g.db
 
 @app.teardown_appcontext
 def close_db(exc):
     db = g.pop("db", None)
     if db: db.close()
+
+def bootstrap_demo_key():
+    """Create default demo123 key if it doesn't exist"""
+    with app.app_context():
+        db = get_db()
+        cur = db.execute("SELECT key FROM api_keys WHERE key='demo123'")
+        if not cur.fetchone():
+            upsert_key("demo123", "demo@example.com", "demo", 50, None, "active", "Bootstrap demo key")
 
 def _today():
     return datetime.date.today().isoformat()
@@ -67,42 +78,209 @@ def _inc_usage(api_key, amt=1):
     db.commit()
     return newc
 
+def gen_key(prefix="key_"):
+    return prefix + secrets.token_urlsafe(24)
+
+def upsert_key(key, email, plan, daily_limit, expires_at=None, status="active", notes=""):
+    db = get_db()
+    created_at = datetime.datetime.utcnow().isoformat()
+    db.execute("""INSERT OR REPLACE INTO api_keys(key,email,plan,daily_limit,expires_at,status,notes,created_at)
+                  VALUES(?,?,?,?,?,?,?,COALESCE((SELECT created_at FROM api_keys WHERE key=?),?))""",
+               (key, email, plan, int(daily_limit), expires_at, status, notes, key, created_at))
+    db.commit()
+    return key
+
+def get_key_row(api_key):
+    db = get_db()
+    cur = db.execute("SELECT key,email,plan,daily_limit,expires_at,status,notes,created_at FROM api_keys WHERE key=?", (api_key,))
+    row = cur.fetchone()
+    if not row: return None
+    obj = {
+        "key": row[0], "email": row[1], "plan": row[2],
+        "daily_limit": int(row[3]),
+        "expires_at": row[4], "status": row[5],
+        "notes": row[6], "created_at": row[7]
+    }
+    # check expiry/status
+    if obj["status"] != "active": return None
+    if obj["expires_at"]:
+        try:
+            if datetime.date.fromisoformat(obj["expires_at"]) < datetime.date.today():
+                return None
+        except:  # bad date format -> treat as expired
+            return None
+    return obj
+
+# --- Auth & quota using api_keys table ---
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+
 def require_api_key(func):
-    from functools import wraps
     @wraps(func)
     def wrapper(*args, **kwargs):
         key = request.headers.get("X-API-Key","").strip() or (request.get_json(silent=True) or {}).get("api_key","")
-        if key not in VALID_KEYS:
-            return jsonify({"error":"Unauthorized: missing or invalid API key"}), 401
-        # store for downstream
-        g.api_key = key
+        row = get_key_row(key)
+        if not row:
+            return jsonify({"error":"Unauthorized: missing/invalid/expired API key"}), 401
+        g.api_key = row["key"]
+        g.daily_limit = row["daily_limit"]
+        return func(*args, **kwargs)
+    return wrapper
+
+def require_admin(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        token = request.headers.get("X-Admin-Token","")
+        if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+            return jsonify({"error":"Forbidden"}), 403
         return func(*args, **kwargs)
     return wrapper
 
 @app.get("/auth/check")
-def auth_check():
-    key = request.headers.get("X-API-Key","").strip()
-    if key in VALID_KEYS:
-        used = _get_usage(key)
-        return jsonify({"ok": True, "limit": DAILY_LIMIT, "used": used, "remaining": max(0, DAILY_LIMIT - used)})
-    return jsonify({"ok": False}), 401
-
-@app.post("/usage/charge")
 @require_api_key
-def usage_charge():
-    data = request.get_json(force=True)
-    amt = int(data.get("amount", 1))
+def auth_check():
     used = _get_usage(g.api_key)
-    if used + amt > DAILY_LIMIT:
-        return jsonify({"error":"Daily limit reached", "used": used, "limit": DAILY_LIMIT}), 429
-    newc = _inc_usage(g.api_key, amt)
-    return jsonify({"ok": True, "used": newc, "limit": DAILY_LIMIT, "remaining": max(0, DAILY_LIMIT - newc)})
+    return jsonify({"ok": True, "limit": g.daily_limit, "used": used, "remaining": max(0, g.daily_limit - used)})
 
 @app.get("/usage")
 @require_api_key
 def usage_get():
     used = _get_usage(g.api_key)
-    return jsonify({"limit": DAILY_LIMIT, "used": used, "remaining": max(0, DAILY_LIMIT - used)})
+    return jsonify({"limit": g.daily_limit, "used": used, "remaining": max(0, g.daily_limit - used)})
+
+@app.post("/usage/charge")
+@require_api_key
+def usage_charge():
+    data = request.get_json(force=True)
+    amt = max(1, int(data.get("amount", 1)))
+    used = _get_usage(g.api_key)
+    if used + amt > g.daily_limit:
+        return jsonify({"error":"Daily limit reached", "used": used, "limit": g.daily_limit}), 429
+    newc = _inc_usage(g.api_key, amt)
+    return jsonify({"ok": True, "used": newc, "limit": g.daily_limit, "remaining": max(0, g.daily_limit - newc)})
+
+# --- Stripe plan mapping + webhook + admin key ops ---
+# Map Stripe Price IDs to key configuration
+# EDIT THESE to your Stripe Price IDs & desired quotas/durations
+PLAN_MAP = {
+    # "price_12345": {"plan":"starter", "daily_limit": 50,  "days_valid": 30},
+    # "price_67890": {"plan":"pro",     "daily_limit": 200, "days_valid": 30},
+}
+
+STRIPE_API_KEY = os.getenv("STRIPE_API_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+
+def _expire_date(days):
+    return (datetime.date.today() + datetime.timedelta(days=int(days))).isoformat()
+
+@app.post("/stripe/webhook")
+def stripe_webhook():
+    # If you install stripe==5.x, uncomment the verification section and use stripe.Webhook.construct_event
+    payload = request.get_data(as_text=True)
+    sig = request.headers.get("Stripe-Signature","")
+
+    # Minimal parsing
+    try:
+        event = json.loads(payload)
+    except Exception:
+        return jsonify({"error":"Invalid payload"}), 400
+
+    etype = event.get("type")
+    data_obj = (event.get("data") or {}).get("object") or {}
+
+    # Handle both one-time Checkout and subscription Invoice paid
+    if etype == "checkout.session.completed":
+        email = (data_obj.get("customer_details") or {}).get("email") or data_obj.get("customer_email") or ""
+        line_items = data_obj.get("display_items") or []  # legacy
+        price_id = None
+        # Prefer modern API: session has 'line_items' if you expand; if not present, rely on metadata
+        # Try metadata.price_id first
+        price_id = (data_obj.get("metadata") or {}).get("price_id") or price_id
+        # If your Checkout passes price_id in metadata, you're good. Otherwise configure your webhook to expand line_items.
+
+        if not price_id and line_items:
+            try: price_id = line_items[0]["price"]["id"]
+            except: pass
+
+        return _issue_key_from_price(email, price_id)
+
+    elif etype in ("invoice.paid", "customer.subscription.created"):
+        # Subscriptions: read price from first line item
+        lines = (data_obj.get("lines") or {}).get("data") or []
+        price_id = None
+        if lines:
+            try: price_id = lines[0]["price"]["id"]
+            except: pass
+        customer_email = (data_obj.get("customer_email") or
+                          ((data_obj.get("customer") or {}).get("email")) or "")
+        # In practice you might need to fetch customer by ID; skipping for simplicity.
+        return _issue_key_from_price(customer_email, price_id)
+
+    # Ignore other events
+    return jsonify({"ok": True})
+
+def _issue_key_from_price(email, price_id):
+    if not price_id or price_id not in PLAN_MAP:
+        # Unknown price -> ignore or log
+        return jsonify({"ok": True, "note": "Unknown price_id; no key issued"}), 200
+    plan = PLAN_MAP[price_id]
+    key = gen_key("live_")
+    expires_at = _expire_date(plan["days_valid"])
+    upsert_key(
+        key=key, email=email or "", plan=plan["plan"],
+        daily_limit=plan["daily_limit"], expires_at=expires_at,
+        status="active", notes=f"issued via webhook price={price_id}"
+    )
+    # TODO: send email with key; for now return OK. You can wire SMTP/SendGrid later.
+    return jsonify({"ok": True, "api_key": key, "plan": plan, "email": email, "expires_at": expires_at})
+
+# -------- Admin endpoints (manual ops) --------
+@app.post("/admin/issue")
+@require_admin
+def admin_issue():
+    data = request.get_json(force=True)
+    email = (data.get("email") or "").strip()
+    plan  = (data.get("plan") or "manual").strip()
+    daily_limit = int(data.get("daily_limit", 50))
+    days_valid  = int(data.get("days_valid", 30))
+    key = gen_key("live_")
+    expires_at = _expire_date(days_valid)
+    upsert_key(key, email, plan, daily_limit, expires_at, "active", "issued manually")
+    return jsonify({"ok": True, "api_key": key, "expires_at": expires_at})
+
+@app.post("/admin/revoke")
+@require_admin
+def admin_revoke():
+    data = request.get_json(force=True)
+    key = (data.get("key") or "").strip()
+    db = get_db()
+    db.execute("UPDATE api_keys SET status='revoked' WHERE key=?", (key,))
+    db.commit()
+    return jsonify({"ok": True})
+
+@app.post("/admin/update_limit")
+@require_admin
+def admin_update_limit():
+    data = request.get_json(force=True)
+    key = (data.get("key") or "").strip()
+    daily_limit = int(data.get("daily_limit", 50))
+    db = get_db()
+    db.execute("UPDATE api_keys SET daily_limit=? WHERE key=?", (daily_limit, key))
+    db.commit()
+    return jsonify({"ok": True})
+
+@app.get("/admin/keys")
+@require_admin
+def admin_keys():
+    db = get_db()
+    cur = db.execute("SELECT key,email,plan,daily_limit,expires_at,status,created_at FROM api_keys ORDER BY created_at DESC")
+    rows = cur.fetchall()
+    items = []
+    for r in rows:
+        items.append({
+            "key": r[0], "email": r[1], "plan": r[2], "daily_limit": r[3],
+            "expires_at": r[4], "status": r[5], "created_at": r[6]
+        })
+    return jsonify({"keys": items})
 
 # ---------------------------
 # Prompt Enhancement Engine
@@ -1112,6 +1290,9 @@ def create_zip():
         
     except Exception as e:
         return jsonify({"error": f"ZIP creation failed: {e}"}), 500
+
+# Create demo key on startup
+bootstrap_demo_key()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)

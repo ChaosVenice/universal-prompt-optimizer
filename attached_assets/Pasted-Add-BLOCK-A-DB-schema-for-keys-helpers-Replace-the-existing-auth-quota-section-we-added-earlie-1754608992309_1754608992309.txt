@@ -1,0 +1,353 @@
+Add BLOCK A (DB schema for keys + helpers).
+
+Replace the existing auth/quota section we added earlier with the updated functions in BLOCK B (DB-backed keys, not env list).
+
+Add BLOCK C (Stripe webhook + manual admin endpoints).
+
+Keep all existing routes (optimize, comfy async, zip, usage, etc.).
+
+Restart the server.
+
+Env to set:
+
+STRIPE_API_KEY = your live/test key
+
+STRIPE_WEBHOOK_SECRET = your webhook signing secret
+
+ADMIN_TOKEN = some long random string
+
+USAGE_DB = usage.db (optional, defaults)
+
+Stripe product mapping: I’ll paste a default PLAN_MAP (edit to your Price IDs).
+
+BLOCK A — DB schema for API keys + helpers (add near top, after imports)
+python
+Copy
+Edit
+# --- API key storage + helpers ---
+import os, sqlite3, datetime, secrets
+from flask import g
+
+DB_PATH = os.getenv("USAGE_DB", "usage.db")
+
+def get_db():
+    if "db" not in g:
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.execute("""CREATE TABLE IF NOT EXISTS usage (
+            key TEXT NOT NULL,
+            day TEXT NOT NULL,
+            count INTEGER NOT NULL,
+            PRIMARY KEY (key, day)
+        )""")
+        g.db.execute("""CREATE TABLE IF NOT EXISTS api_keys (
+            key TEXT PRIMARY KEY,
+            email TEXT,
+            plan TEXT,
+            daily_limit INTEGER NOT NULL,
+            expires_at TEXT,          -- ISO date (YYYY-MM-DD) or NULL
+            status TEXT NOT NULL,     -- 'active' | 'revoked'
+            notes TEXT,
+            created_at TEXT NOT NULL  -- ISO datetime
+        )""")
+    return g.db
+
+@app.teardown_appcontext
+def close_db(exc):
+    db = g.pop("db", None)
+    if db: db.close()
+
+def _today():
+    return datetime.date.today().isoformat()
+
+def gen_key(prefix="key_"):
+    return prefix + secrets.token_urlsafe(24)
+
+def upsert_key(key, email, plan, daily_limit, expires_at=None, status="active", notes=""):
+    db = get_db()
+    created_at = datetime.datetime.utcnow().isoformat()
+    db.execute("""INSERT OR REPLACE INTO api_keys(key,email,plan,daily_limit,expires_at,status,notes,created_at)
+                  VALUES(?,?,?,?,?,?,?,COALESCE((SELECT created_at FROM api_keys WHERE key=?),?))""",
+               (key, email, plan, int(daily_limit), expires_at, status, notes, key, created_at))
+    db.commit()
+    return key
+
+def get_key_row(api_key):
+    db = get_db()
+    cur = db.execute("SELECT key,email,plan,daily_limit,expires_at,status,notes,created_at FROM api_keys WHERE key=?", (api_key,))
+    row = cur.fetchone()
+    if not row: return None
+    obj = {
+        "key": row[0], "email": row[1], "plan": row[2],
+        "daily_limit": int(row[3]),
+        "expires_at": row[4], "status": row[5],
+        "notes": row[6], "created_at": row[7]
+    }
+    # check expiry/status
+    if obj["status"] != "active": return None
+    if obj["expires_at"]:
+        try:
+            if datetime.date.fromisoformat(obj["expires_at"]) < datetime.date.today():
+                return None
+        except:  # bad date format -> treat as expired
+            return None
+    return obj
+
+def _get_usage(api_key):
+    db = get_db()
+    day = _today()
+    cur = db.execute("SELECT count FROM usage WHERE key=? AND day=?", (api_key, day))
+    row = cur.fetchone()
+    return row[0] if row else 0
+
+def _inc_usage(api_key, amt=1):
+    db = get_db()
+    day = _today()
+    cur = db.execute("SELECT count FROM usage WHERE key=? AND day=?", (api_key, day))
+    row = cur.fetchone()
+    if row:
+        newc = row[0] + amt
+        db.execute("UPDATE usage SET count=? WHERE key=? AND day=?", (newc, api_key, day))
+    else:
+        newc = amt
+        db.execute("INSERT INTO usage(key,day,count) VALUES(?,?,?)", (api_key, day, newc))
+    db.commit()
+    return newc
+BLOCK B — Replace previous auth/quota with DB-backed version
+python
+Copy
+Edit
+# --- Auth & quota using api_keys table ---
+from functools import wraps
+from flask import request, jsonify
+
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+
+def require_api_key(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        key = request.headers.get("X-API-Key","").strip() or (request.get_json(silent=True) or {}).get("api_key","")
+        row = get_key_row(key)
+        if not row:
+            return jsonify({"error":"Unauthorized: missing/invalid/expired API key"}), 401
+        g.api_key = row["key"]
+        g.daily_limit = row["daily_limit"]
+        return func(*args, **kwargs)
+    return wrapper
+
+def require_admin(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        token = request.headers.get("X-Admin-Token","")
+        if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+            return jsonify({"error":"Forbidden"}), 403
+        return func(*args, **kwargs)
+    return wrapper
+
+@app.get("/auth/check")
+@require_api_key
+def auth_check():
+    used = _get_usage(g.api_key)
+    return jsonify({"ok": True, "limit": g.daily_limit, "used": used, "remaining": max(0, g.daily_limit - used)})
+
+@app.get("/usage")
+@require_api_key
+def usage_get():
+    used = _get_usage(g.api_key)
+    return jsonify({"limit": g.daily_limit, "used": used, "remaining": max(0, g.daily_limit - used)})
+
+@app.post("/usage/charge")
+@require_api_key
+def usage_charge():
+    data = request.get_json(force=True)
+    amt = max(1, int(data.get("amount", 1)))
+    used = _get_usage(g.api_key)
+    if used + amt > g.daily_limit:
+        return jsonify({"error":"Daily limit reached", "used": used, "limit": g.daily_limit}), 429
+    newc = _inc_usage(g.api_key, amt)
+    return jsonify({"ok": True, "used": newc, "limit": g.daily_limit, "remaining": max(0, g.daily_limit - newc)})
+Note: Update your existing generate endpoints to include @require_api_key (if not already present) and keep charging usage via /usage/charge when jobs complete.
+
+BLOCK C — Stripe webhook + manual admin key issuance
+python
+Copy
+Edit
+# --- Stripe plan mapping + webhook + admin key ops ---
+import json, datetime
+from flask import abort
+
+# Map Stripe Price IDs to key configuration
+# EDIT THESE to your Stripe Price IDs & desired quotas/durations
+PLAN_MAP = {
+    # "price_12345": {"plan":"starter", "daily_limit": 50,  "days_valid": 30},
+    # "price_67890": {"plan":"pro",     "daily_limit": 200, "days_valid": 30},
+}
+
+STRIPE_API_KEY = os.getenv("STRIPE_API_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+
+# We avoid importing Stripe SDK to keep deps simple.
+# We'll verify signature manually is tricky; easier to trust the proxy or set the secret and skip strict verify in Replit.
+# If you can install 'stripe' pip package, switch to official verify. For now, we do a "best effort" check.
+
+def _expire_date(days):
+    return (datetime.date.today() + datetime.timedelta(days=int(days))).isoformat()
+
+@app.post("/stripe/webhook")
+def stripe_webhook():
+    # If you install stripe==5.x, uncomment the verification section and use stripe.Webhook.construct_event
+    payload = request.get_data(as_text=True)
+    sig = request.headers.get("Stripe-Signature","")
+
+    # Minimal parsing
+    try:
+        event = json.loads(payload)
+    except Exception:
+        return jsonify({"error":"Invalid payload"}), 400
+
+    etype = event.get("type")
+    data_obj = (event.get("data") or {}).get("object") or {}
+
+    # Handle both one-time Checkout and subscription Invoice paid
+    if etype == "checkout.session.completed":
+        email = (data_obj.get("customer_details") or {}).get("email") or data_obj.get("customer_email") or ""
+        line_items = data_obj.get("display_items") or []  # legacy
+        price_id = None
+        # Prefer modern API: session has 'line_items' if you expand; if not present, rely on metadata
+        # Try metadata.price_id first
+        price_id = (data_obj.get("metadata") or {}).get("price_id") or price_id
+        # If your Checkout passes price_id in metadata, you're good. Otherwise configure your webhook to expand line_items.
+
+        if not price_id and line_items:
+            try: price_id = line_items[0]["price"]["id"]
+            except: pass
+
+        return _issue_key_from_price(email, price_id)
+
+    elif etype in ("invoice.paid", "customer.subscription.created"):
+        # Subscriptions: read price from first line item
+        lines = (data_obj.get("lines") or {}).get("data") or []
+        price_id = None
+        if lines:
+            try: price_id = lines[0]["price"]["id"]
+            except: pass
+        customer_email = (data_obj.get("customer_email") or
+                          ((data_obj.get("customer") or {}).get("email")) or "")
+        # In practice you might need to fetch customer by ID; skipping for simplicity.
+        return _issue_key_from_price(customer_email, price_id)
+
+    # Ignore other events
+    return jsonify({"ok": True})
+
+def _issue_key_from_price(email, price_id):
+    if not price_id or price_id not in PLAN_MAP:
+        # Unknown price -> ignore or log
+        return jsonify({"ok": True, "note": "Unknown price_id; no key issued"}), 200
+    plan = PLAN_MAP[price_id]
+    key = gen_key("live_")
+    expires_at = _expire_date(plan["days_valid"])
+    upsert_key(
+        key=key, email=email or "", plan=plan["plan"],
+        daily_limit=plan["daily_limit"], expires_at=expires_at,
+        status="active", notes=f"issued via webhook price={price_id}"
+    )
+    # TODO: send email with key; for now return OK. You can wire SMTP/SendGrid later.
+    return jsonify({"ok": True, "api_key": key, "plan": plan, "email": email, "expires_at": expires_at})
+
+# -------- Admin endpoints (manual ops) --------
+@app.post("/admin/issue")
+@require_admin
+def admin_issue():
+    data = request.get_json(force=True)
+    email = (data.get("email") or "").strip()
+    plan  = (data.get("plan") or "manual").strip()
+    daily_limit = int(data.get("daily_limit", 50))
+    days_valid  = int(data.get("days_valid", 30))
+    key = gen_key("live_")
+    expires_at = _expire_date(days_valid)
+    upsert_key(key, email, plan, daily_limit, expires_at, "active", "issued manually")
+    return jsonify({"ok": True, "api_key": key, "expires_at": expires_at})
+
+@app.post("/admin/revoke")
+@require_admin
+def admin_revoke():
+    data = request.get_json(force=True)
+    key = (data.get("key") or "").strip()
+    db = get_db()
+    db.execute("UPDATE api_keys SET status='revoked' WHERE key=?", (key,))
+    db.commit()
+    return jsonify({"ok": True})
+
+@app.post("/admin/update_limit")
+@require_admin
+def admin_update_limit():
+    data = request.get_json(force=True)
+    key = (data.get("key") or "").strip()
+    daily_limit = int(data.get("daily_limit", 50))
+    db = get_db()
+    db.execute("UPDATE api_keys SET daily_limit=? WHERE key=?", (daily_limit, key))
+    db.commit()
+    return jsonify({"ok": True})
+
+@app.get("/admin/keys")
+@require_admin
+def admin_keys():
+    db = get_db()
+    cur = db.execute("SELECT key,email,plan,daily_limit,expires_at,status,created_at FROM api_keys ORDER BY created_at DESC")
+    rows = cur.fetchall()
+    items = []
+    for r in rows:
+        items.append({
+            "key": r[0], "email": r[1], "plan": r[2], "daily_limit": r[3],
+            "expires_at": r[4], "status": r[5], "created_at": r[6]
+        })
+    return jsonify({"keys": items})
+How to hook Stripe (quick)
+In Stripe Dashboard → Products/Prices, create your prices (one-time or recurring).
+
+Put their Price IDs into PLAN_MAP with daily_limit and days_valid. Example:
+
+python
+Copy
+Edit
+PLAN_MAP = {
+    "price_basic123": {"plan":"basic","daily_limit":50,"days_valid":30},
+    "price_pro456":   {"plan":"pro","daily_limit":200,"days_valid":30},
+}
+Create a Checkout Session that passes the Price ID. Easiest is to add the price to the session, and also add metadata: { price_id: 'price_basic123' } to the session so our webhook can read it without expansions.
+
+Add a Webhook endpoint pointing to https://<your-host>/stripe/webhook and select events:
+
+checkout.session.completed
+
+invoice.paid (optional, for subscriptions)
+
+Set env STRIPE_WEBHOOK_SECRET (if you later switch to SDK verification).
+
+Client/UI impact
+No UI changes needed. Users paste their API key (which is now generated via Stripe) in Settings and the quota bar already works—because /usage is now DB-backed per key.
+
+Quick admin tests (tell your Agent to run):
+bash
+Copy
+Edit
+# 1) Manually issue a key
+curl -s -X POST http://localhost:5000/admin/issue \
+ -H "Content-Type: application/json" -H "X-Admin-Token: YOUR_ADMIN_TOKEN" \
+ -d '{"email":"test@example.com","plan":"manual","daily_limit":25,"days_valid":7}' | jq .
+
+# 2) Check it works
+NEWKEY="paste_key_from_step_1"
+curl -s http://localhost:5000/usage -H "X-API-Key: $NEWKEY" | jq .
+
+# 3) Charge 2 uses
+curl -s -X POST http://localhost:5000/usage/charge \
+ -H "Content-Type: application/json" -H "X-API-Key: $NEWKEY" \
+ -d '{"amount":2}' | jq .
+
+# 4) Revoke it
+curl -s -X POST http://localhost:5000/admin/revoke \
+ -H "Content-Type: application/json" -H "X-Admin-Token: YOUR_ADMIN_TOKEN" \
+ -d "{\"key\":\"$NEWKEY\"}" | jq .
+
+# 5) Confirm now blocked
+curl -s http://localhost:5000/usage -H "X-API-Key: $NEWKEY"
