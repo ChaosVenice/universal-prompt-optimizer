@@ -1,0 +1,122 @@
+import os, time, json
+from urllib import request as urlreq
+from urllib.error import URLError, HTTPError
+from flask import abort
+
+def _http_post_json(url, payload):
+    data = json.dumps(payload).encode("utf-8")
+    req = urlreq.Request(url, data=data, headers={"Content-Type":"application/json"})
+    with urlreq.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+def _http_get_json(url):
+    with urlreq.urlopen(url, timeout=15) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+def _build_default_sdxl_workflow(pos, neg, w, h, steps=30, cfg=6.5, sampler="dpmpp_2m"):
+    """
+    A minimal SDXL text2img workflow_api graph.
+    You may need to adjust model/vae names to match your local installation.
+    """
+    return {
+      "3": {"class_type": "KSampler", "inputs": {
+        "seed": 123456789, "steps": steps, "cfg": cfg, "sampler_name": sampler,
+        "scheduler": "karras", "denoise": 1.0,
+        "model": ["21", 0], "positive": ["12", 0], "negative": ["13", 0], "latent_image": ["5", 0]
+      }},
+      "5": {"class_type": "EmptyLatentImage", "inputs": {"width": w, "height": h, "batch_size": 1}},
+      "7": {"class_type": "VAEDecode", "inputs": {"samples": ["3", 0], "vae": ["22", 0]}},
+      "8": {"class_type": "SaveImage", "inputs": {"images": ["7", 0]}},
+      "12": {"class_type": "CLIPTextEncodeSDXL", "inputs": {"text_g": pos, "text_l": pos, "clip": ["20", 0]}},
+      "13": {"class_type": "CLIPTextEncodeSDXL", "inputs": {"text_g": neg, "text_l": neg, "clip": ["20", 0]}},
+      "20": {"class_type": "CLIPSetLastLayer", "inputs": {"stop_at_clip_layer": -1, "clip": ["19", 0]}},
+      "21": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
+      "22": {"class_type": "VAELoader", "inputs": {"vae_name": "sdxl_vae.safetensors"}},
+      "19": {"class_type": "CLIPLoader", "inputs": {"clip_name": "sdxl_clip.safetensors"}}
+    }
+
+@app.post("/generate/comfy")
+def generate_comfy():
+    """
+    Body: {
+      "host": "http://127.0.0.1:8188",
+      "workflow_override": "<optional workflow_api JSON string>",
+      "sdxl": { "positive": "...", "negative": "...", "settings": { "width": 1344, "height": 768, "steps": 30, "cfg_scale": 6.5, "sampler": "DPM++ 2M Karras" } }
+    }
+    """
+    data = request.get_json(force=True)
+    host = (data.get("host") or "").rstrip("/")
+    if not host:
+        return jsonify({"error":"Missing ComfyUI host"}), 400
+
+    sdxl = data.get("sdxl") or {}
+    positive = sdxl.get("positive") or ""
+    negative = sdxl.get("negative") or ""
+    settings = sdxl.get("settings") or {}
+    w = int(settings.get("width", 1024))
+    h = int(settings.get("height", 1024))
+    steps = int(settings.get("steps", 30))
+    cfg = float(settings.get("cfg_scale", 6.5))
+    # Map our sampler to ComfyUI's internal shortname
+    sampler_map = {
+        "DPM++ 2M Karras": "dpmpp_2m", "DPM++ 2M": "dpmpp_2m",
+        "DPM++ SDE Karras": "dpmpp_sde", "Euler a": "euler_ancestral"
+    }
+    sampler = sampler_map.get(settings.get("sampler","DPM++ 2M Karras"), "dpmpp_2m")
+
+    # Workflow override?
+    wf_override_raw = data.get("workflow_override") or ""
+    if wf_override_raw.strip():
+        try:
+            g = json.loads(wf_override_raw)
+            # best-effort injection: find text encode nodes & latent size
+            for k, node in g.items():
+                if node.get("class_type","").lower().startswith("cliptextencode"):
+                    # try to set both text fields if present
+                    for key in ("text","text_g","text_l"):
+                        if key in node.get("inputs", {}):
+                            node["inputs"][key] = positive
+                if node.get("class_type","").lower().startswith("emptylatentimage"):
+                    node["inputs"]["width"] = w
+                    node["inputs"]["height"] = h
+            graph = g
+        except Exception as e:
+            return jsonify({"error": f"Invalid workflow_override JSON: {e}"}), 400
+    else:
+        graph = _build_default_sdxl_workflow(positive, negative, w, h, steps=steps, cfg=cfg, sampler=sampler)
+
+    try:
+        # queue the prompt
+        out = _http_post_json(f"{host}/prompt", {"prompt": graph})
+        prompt_id = out.get("prompt_id")
+        if not prompt_id:
+            return jsonify({"error":"No prompt_id returned from ComfyUI"}), 502
+
+        # poll history
+        start = time.time()
+        image_urls = []
+        while time.time() - start < 120:
+            hist = _http_get_json(f"{host}/history/{prompt_id}")
+            # images are under any SaveImage node outputs
+            for node_id, node_data in (hist.get(prompt_id) or {}).get("outputs", {}).items():
+                if "images" in node_data:
+                    for img in node_data["images"]:
+                        fname = img.get("filename")
+                        subf = img.get("subfolder","")
+                        if fname:
+                            url = f"{host}/view?filename={fname}&subfolder={subf}&type=output"
+                            if url not in image_urls:
+                                image_urls.append(url)
+            if image_urls:
+                break
+            time.sleep(1.2)
+
+        if not image_urls:
+            return jsonify({"error":"Timed out waiting for images"}), 504
+
+        return jsonify({"ok": True, "images": image_urls}), 200
+
+    except (URLError, HTTPError) as e:
+        return jsonify({"error": f"Network error contacting ComfyUI: {e}"}), 502
+    except Exception as e:
+        return jsonify({"error": f"Unexpected error: {e}"}), 500
