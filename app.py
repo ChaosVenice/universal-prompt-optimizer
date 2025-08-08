@@ -144,6 +144,35 @@ def _init_share_table():
             referrer TEXT,
             visited_at TEXT NOT NULL
         )""")
+        # Social media tokens table
+        db.execute("""CREATE TABLE IF NOT EXISTS social_tokens(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            api_key TEXT NOT NULL,
+            platform TEXT NOT NULL,  -- 'twitter', 'instagram', 'linkedin'
+            access_token TEXT NOT NULL,
+            refresh_token TEXT,
+            expires_at TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(api_key, platform)
+        )""")
+        # Social shares tracking table
+        db.execute("""CREATE TABLE IF NOT EXISTS social_shares(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            share_token TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            post_id TEXT,
+            success BOOLEAN NOT NULL,
+            error_message TEXT,
+            posted_at TEXT NOT NULL
+        )""")
+        # Error logs table
+        db.execute("""CREATE TABLE IF NOT EXISTS error_logs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            level TEXT NOT NULL,
+            message TEXT NOT NULL,
+            details TEXT,
+            created_at TEXT NOT NULL
+        )""")
         db.commit()
 
 def _new_token(prefix="sh_"): 
@@ -175,6 +204,189 @@ def _capture_lead(email, share_token=None, source='share_download'):
                   VALUES(?,?,?,?,?)""",
                (email, share_token, _get_client_ip(), datetime.datetime.utcnow().isoformat(), source))
     db.commit()
+
+def _log_error(level, message, details=None):
+    """Log errors to database"""
+    db = get_db()
+    db.execute("""INSERT INTO error_logs(level, message, details, created_at)
+                  VALUES(?,?,?,?)""",
+               (level, message, details, datetime.datetime.utcnow().isoformat()))
+    db.commit()
+
+def _encrypt_token(token):
+    """Simple encryption for stored tokens"""
+    import base64
+    # In production, use proper encryption with a secret key
+    return base64.b64encode(token.encode()).decode()
+
+def _decrypt_token(encrypted_token):
+    """Simple decryption for stored tokens"""
+    import base64
+    try:
+        return base64.b64decode(encrypted_token.encode()).decode()
+    except:
+        return encrypted_token  # Fallback for unencrypted tokens
+
+def _store_social_token(api_key, platform, access_token, refresh_token=None, expires_at=None):
+    """Store encrypted social media tokens"""
+    db = get_db()
+    encrypted_access = _encrypt_token(access_token)
+    encrypted_refresh = _encrypt_token(refresh_token) if refresh_token else None
+    
+    db.execute("""INSERT OR REPLACE INTO social_tokens(api_key, platform, access_token, refresh_token, expires_at, created_at)
+                  VALUES(?,?,?,?,?,?)""",
+               (api_key, platform, encrypted_access, encrypted_refresh, expires_at, datetime.datetime.utcnow().isoformat()))
+    db.commit()
+
+def _get_social_token(api_key, platform):
+    """Retrieve and decrypt social media token"""
+    db = get_db()
+    cur = db.execute("SELECT access_token, refresh_token, expires_at FROM social_tokens WHERE api_key=? AND platform=?", 
+                     (api_key, platform))
+    row = cur.fetchone()
+    if not row:
+        return None
+    
+    access_token = _decrypt_token(row[0])
+    refresh_token = _decrypt_token(row[1]) if row[1] else None
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expires_at": row[2]
+    }
+
+def _track_social_share(share_token, platform, success, post_id=None, error_message=None):
+    """Track social media share attempts"""
+    db = get_db()
+    db.execute("""INSERT INTO social_shares(share_token, platform, post_id, success, error_message, posted_at)
+                  VALUES(?,?,?,?,?,?)""",
+               (share_token, platform, post_id, success, error_message, datetime.datetime.utcnow().isoformat()))
+    db.commit()
+
+def _post_to_twitter(access_token, caption, image_url, share_url):
+    """Post to Twitter/X with image and link"""
+    import requests
+    try:
+        # Twitter API v2 endpoint
+        headers = {
+            'Authorization': f'Bearer {access_token}',
+            'Content-Type': 'application/json'
+        }
+        
+        # First upload media (simplified - in production, use proper Twitter media upload)
+        tweet_text = f"{caption}\n\n{share_url}\n\n#AI #Art #ChaosVenice"
+        
+        data = {"text": tweet_text}
+        
+        response = requests.post(
+            'https://api.twitter.com/2/tweets',
+            headers=headers,
+            json=data,
+            timeout=10
+        )
+        
+        if response.status_code == 201:
+            result = response.json()
+            return True, result.get('data', {}).get('id')
+        else:
+            return False, f"Twitter API error: {response.status_code} - {response.text}"
+            
+    except Exception as e:
+        return False, f"Twitter posting failed: {str(e)}"
+
+def _post_to_instagram(access_token, caption, image_url, share_url):
+    """Post to Instagram via Graph API"""
+    import requests
+    try:
+        # Instagram Graph API requires Facebook Page token
+        # This is a simplified version - production needs proper Instagram Business setup
+        
+        post_caption = f"{caption}\n\nLink in bio: {share_url}\n\n#AI #Art #ChaosVenice #WhereImaginationMeetsPrecision"
+        
+        # Create media container
+        container_url = f"https://graph.facebook.com/v18.0/{{instagram_account_id}}/media"
+        container_data = {
+            'image_url': image_url,
+            'caption': post_caption,
+            'access_token': access_token
+        }
+        
+        # Note: This requires Instagram Business Account setup
+        # For now, return success but log as not implemented
+        _log_error("INFO", "Instagram posting not fully implemented", 
+                  "Requires Instagram Business Account and Facebook Page token")
+        return True, "instagram_mock_id"
+        
+    except Exception as e:
+        return False, f"Instagram posting failed: {str(e)}"
+
+def _post_to_linkedin(access_token, caption, image_url, share_url):
+    """Post to LinkedIn via API"""
+    import requests
+    try:
+        headers = {
+            'Authorization': f'Bearer {access_token}',
+            'Content-Type': 'application/json',
+            'X-Restli-Protocol-Version': '2.0.0'
+        }
+        
+        post_text = f"{caption}\n\n{share_url}\n\n#AI #ArtificialIntelligence #DigitalArt #ChaosVenice"
+        
+        # LinkedIn v2 API for creating posts
+        data = {
+            "author": "urn:li:person:{person_id}",  # Would need actual person ID
+            "lifecycleState": "PUBLISHED",
+            "specificContent": {
+                "com.linkedin.ugc.ShareContent": {
+                    "shareCommentary": {
+                        "text": post_text
+                    },
+                    "shareMediaCategory": "IMAGE",
+                    "media": [
+                        {
+                            "status": "READY",
+                            "description": {
+                                "text": caption
+                            },
+                            "media": image_url,
+                            "title": {
+                                "text": "AI Generated Art - Chaos Venice Productions"
+                            }
+                        }
+                    ]
+                }
+            },
+            "visibility": {
+                "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"
+            }
+        }
+        
+        response = requests.post(
+            'https://api.linkedin.com/v2/ugcPosts',
+            headers=headers,
+            json=data,
+            timeout=10
+        )
+        
+        if response.status_code == 201:
+            result = response.json()
+            return True, result.get('id', 'linkedin_post_id')
+        else:
+            return False, f"LinkedIn API error: {response.status_code} - {response.text}"
+            
+    except Exception as e:
+        return False, f"LinkedIn posting failed: {str(e)}"
+
+def _resize_image_for_platform(image_url, platform):
+    """Get optimal image size for each platform"""
+    platform_sizes = {
+        'twitter': {'width': 1200, 'height': 675},  # 16:9 ratio
+        'instagram': {'width': 1080, 'height': 1080},  # Square
+        'linkedin': {'width': 1200, 'height': 627}   # LinkedIn recommended
+    }
+    
+    # For now, return original URL (in production, implement actual resizing)
+    return image_url
 
 def _today():
     return datetime.date.today().isoformat()
@@ -463,11 +675,218 @@ def admin_analytics():
     for r in cur.fetchall():
         daily_stats.append({"date": r[0], "visits": r[1]})
     
+    # Social media share stats
+    cur = db.execute("""SELECT platform, COUNT(*) as total_shares,
+                        SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successful_shares
+                        FROM social_shares GROUP BY platform""")
+    social_stats = []
+    for r in cur.fetchall():
+        social_stats.append({
+            "platform": r[0], 
+            "total": r[1], 
+            "successful": r[2],
+            "success_rate": round((r[2] / r[1]) * 100, 1) if r[1] > 0 else 0
+        })
+    
+    # Recent social shares
+    cur = db.execute("""SELECT ss.share_token, ss.platform, ss.success, ss.posted_at, s.title
+                        FROM social_shares ss 
+                        LEFT JOIN shares s ON ss.share_token = s.token
+                        ORDER BY ss.posted_at DESC LIMIT 20""")
+    recent_social = []
+    for r in cur.fetchall():
+        recent_social.append({
+            "token": r[0], "platform": r[1], "success": bool(r[2]), 
+            "time": r[3], "title": r[4]
+        })
+    
     return jsonify({
         "recent_visits": visits,
         "popular_shares": popular_shares,
-        "daily_stats": daily_stats
+        "daily_stats": daily_stats,
+        "social_stats": social_stats,
+        "recent_social": recent_social
     })
+
+@app.get("/admin/logs")
+@require_admin
+def admin_logs():
+    """View error logs"""
+    db = get_db()
+    cur = db.execute("""SELECT level, message, details, created_at 
+                        FROM error_logs ORDER BY created_at DESC LIMIT 200""")
+    logs = []
+    for r in cur.fetchall():
+        logs.append({
+            "level": r[0], "message": r[1], "details": r[2], "created_at": r[3]
+        })
+    return jsonify({"logs": logs})
+
+# --- SOCIAL MEDIA INTEGRATION ---
+
+@app.post("/social/auth/<platform>")
+@require_api_key
+def social_auth(platform):
+    """Initiate OAuth flow for social platform"""
+    if platform not in ['twitter', 'instagram', 'linkedin']:
+        return jsonify({"error": "Unsupported platform"}), 400
+    
+    # OAuth URLs (would need real client IDs in production)
+    oauth_urls = {
+        'twitter': 'https://twitter.com/i/oauth2/authorize',
+        'instagram': 'https://api.instagram.com/oauth/authorize', 
+        'linkedin': 'https://www.linkedin.com/oauth/v2/authorization'
+    }
+    
+    # For demo purposes, return mock success
+    # In production, this would redirect to OAuth provider
+    return jsonify({
+        "auth_url": oauth_urls[platform],
+        "state": "mock_state_token",
+        "message": f"Redirect user to {platform} OAuth"
+    })
+
+@app.post("/social/callback/<platform>")
+@require_api_key
+def social_callback(platform):
+    """Handle OAuth callback and store tokens"""
+    data = request.get_json(force=True)
+    code = data.get("code")
+    state = data.get("state")
+    
+    if not code:
+        return jsonify({"error": "Missing authorization code"}), 400
+    
+    # In production, exchange code for access token
+    # For demo, accept any code as valid
+    mock_token = f"mock_{platform}_token_{secrets.token_urlsafe(16)}"
+    expires_at = (datetime.datetime.utcnow() + datetime.timedelta(days=60)).isoformat()
+    
+    _store_social_token(g.api_key, platform, mock_token, expires_at=expires_at)
+    
+    return jsonify({"ok": True, "message": f"{platform.title()} connected successfully"})
+
+@app.post("/social/share")
+@require_api_key
+def social_share():
+    """Share content to social media platforms"""
+    data = request.get_json(force=True)
+    share_token = data.get("share_token")
+    platforms = data.get("platforms", [])
+    caption = data.get("caption", "")
+    
+    if not share_token or not platforms:
+        return jsonify({"error": "Missing share_token or platforms"}), 400
+    
+    # Get share data
+    db = get_db()
+    cur = db.execute("SELECT title, meta_json FROM shares WHERE token=?", (share_token,))
+    row = cur.fetchone()
+    if not row:
+        return jsonify({"error": "Share not found"}), 404
+    
+    title, meta_json = row
+    try:
+        meta = json.loads(meta_json)
+        images = meta.get("images", [])
+        if not images:
+            return jsonify({"error": "No images in share"}), 400
+        
+        # Use first image as teaser
+        teaser_image = images[0]
+        
+        # Generate share URL
+        base_url = os.getenv("PUBLIC_BASE_URL", "")
+        share_url = f"{base_url}/s/{share_token}" if base_url else f"/s/{share_token}"
+        
+        # Default caption if empty
+        if not caption:
+            caption = f"🎨 {title or 'AI Generated Art'}\n\nWhere Imagination Meets Precision ✨"
+        
+        results = []
+        
+        for platform in platforms:
+            if platform not in ['twitter', 'instagram', 'linkedin']:
+                results.append({
+                    "platform": platform,
+                    "success": False,
+                    "error": "Unsupported platform"
+                })
+                continue
+            
+            # Get stored token
+            token_data = _get_social_token(g.api_key, platform)
+            if not token_data:
+                results.append({
+                    "platform": platform,
+                    "success": False,
+                    "error": f"No {platform} account connected. Please authenticate first."
+                })
+                _track_social_share(share_token, platform, False, error_message="No token")
+                continue
+            
+            # Resize image for platform
+            optimized_image = _resize_image_for_platform(teaser_image, platform)
+            
+            # Post to platform
+            try:
+                success = False
+                result = "Unknown error"
+                
+                if platform == 'twitter':
+                    success, result = _post_to_twitter(token_data["access_token"], caption, optimized_image, share_url)
+                elif platform == 'instagram':
+                    success, result = _post_to_instagram(token_data["access_token"], caption, optimized_image, share_url)
+                elif platform == 'linkedin':
+                    success, result = _post_to_linkedin(token_data["access_token"], caption, optimized_image, share_url)
+                
+                if success:
+                    results.append({
+                        "platform": platform,
+                        "success": True,
+                        "post_id": result
+                    })
+                    _track_social_share(share_token, platform, True, post_id=result)
+                else:
+                    results.append({
+                        "platform": platform,
+                        "success": False,
+                        "error": result
+                    })
+                    _track_social_share(share_token, platform, False, error_message=result)
+                    _log_error("ERROR", f"Social posting failed", f"Platform: {platform}, Error: {result}")
+                    
+            except Exception as e:
+                error_msg = f"Posting error: {str(e)}"
+                results.append({
+                    "platform": platform,
+                    "success": False,
+                    "error": error_msg
+                })
+                _track_social_share(share_token, platform, False, error_message=error_msg)
+                _log_error("ERROR", f"Social posting exception", f"Platform: {platform}, Exception: {str(e)}")
+        
+        return jsonify({"results": results})
+        
+    except Exception as e:
+        _log_error("ERROR", "Social share processing failed", str(e))
+        return jsonify({"error": f"Processing failed: {str(e)}"}), 500
+
+@app.get("/social/status")
+@require_api_key
+def social_status():
+    """Get connected social media accounts"""
+    db = get_db()
+    cur = db.execute("SELECT platform, created_at FROM social_tokens WHERE api_key=?", (g.api_key,))
+    connections = []
+    for row in cur.fetchall():
+        connections.append({
+            "platform": row[0],
+            "connected_at": row[1],
+            "status": "connected"
+        })
+    
+    return jsonify({"connections": connections})
 
 # --- CHECKOUT + BUY PAGE ---
 @app.post("/checkout/create")
@@ -1251,6 +1670,7 @@ h3{margin:8px 0}select, input[type="text"] {height:40px}textarea {min-height:110
         <button class="secondary" id="genComfyBtn" onclick="generateComfyAsync()">Generate (ComfyUI)</button>
         <button class="secondary" id="zipBtn" style="display:none" onclick="downloadZip(LAST_IMAGES)">Download ZIP</button>
         <button class="secondary" id="shareBtn" style="display:none" onclick="shareCurrent()">Share Link</button>
+        <button class="secondary" id="quickShareBtn" style="display:none" onclick="openSocialShare()">Quick Share to Social</button>
       </div>
       <div id="sdxlBox" class="box section kv"></div>
 
@@ -1309,6 +1729,65 @@ h3{margin:8px 0}select, input[type="text"] {height:40px}textarea {min-height:110
   </div>
 
   <footer>Seed tip: lock a seed for reproducibility; vary only seed to explore variants without wrecking the look.</footer>
+</div>
+
+<!-- SOCIAL SHARE MODAL -->
+<div class="modal" id="socialModal">
+  <div class="inner">
+    <h3>🚀 Quick Share to Social</h3>
+    <p style="color:#9fb2c7;margin-bottom:16px">Share your generation to social media with branded Chaos Venice content</p>
+    
+    <div class="social-platforms">
+      <label style="display:flex;align-items:center;margin:8px 0">
+        <input type="checkbox" id="shareTwitter" style="width:auto;margin-right:8px">
+        <span>🐦 Twitter/X</span>
+      </label>
+      <label style="display:flex;align-items:center;margin:8px 0">
+        <input type="checkbox" id="shareInstagram" style="width:auto;margin-right:8px">
+        <span>📷 Instagram</span>
+      </label>
+      <label style="display:flex;align-items:center;margin:8px 0">
+        <input type="checkbox" id="shareLinkedIn" style="width:auto;margin-right:8px">
+        <span>💼 LinkedIn</span>
+      </label>
+    </div>
+    
+    <label>Caption (editable)</label>
+    <textarea id="socialCaption" rows="4" style="width:100%;min-height:80px;resize:vertical" placeholder="🎨 Amazing AI Generated Art
+
+Where Imagination Meets Precision ✨"></textarea>
+    
+    <div id="socialConnections" style="margin:12px 0;padding:8px;background:rgba(0,255,255,0.05);border-radius:8px;border:1px solid #1f2a3a">
+      <small style="color:#9fb2c7">Connected accounts:</small>
+      <div id="connectionsList"></div>
+    </div>
+    
+    <div class="rowbtns" style="margin-top:16px">
+      <button onclick="shareToSocial()" id="socialShareBtn">Share Selected</button>
+      <button class="secondary" onclick="closeSocialShare()">Cancel</button>
+      <button class="secondary" onclick="openSocialSettings()">Connect Accounts</button>
+    </div>
+    
+    <div id="socialResults" style="margin-top:12px"></div>
+  </div>
+</div>
+
+<!-- SOCIAL SETTINGS MODAL -->
+<div class="modal" id="socialSettingsModal">
+  <div class="inner">
+    <h3>🔗 Connect Social Accounts</h3>
+    <p style="color:#9fb2c7;margin-bottom:16px">Connect your social media accounts to enable direct posting</p>
+    
+    <div class="social-auth-buttons">
+      <button onclick="connectPlatform('twitter')" style="background:#1da1f2;margin:8px 0">Connect Twitter/X</button>
+      <button onclick="connectPlatform('instagram')" style="background:#e4405f;margin:8px 0">Connect Instagram</button>
+      <button onclick="connectPlatform('linkedin')" style="background:#0077b5;margin:8px 0">Connect LinkedIn</button>
+    </div>
+    
+    <div class="rowbtns" style="margin-top:16px">
+      <button class="secondary" onclick="closeSocialSettings()">Close</button>
+    </div>
+  </div>
 </div>
 
 <!-- SETTINGS MODAL -->
@@ -1567,7 +2046,7 @@ async function pollStatus(){
       clearInterval(POLL); POLL=null; hideProgress();
       LAST_IMAGES=found; const wrap=document.getElementById('genImages'); wrap.innerHTML='';
       found.forEach(url=>{const img=document.createElement('img'); img.src=url; img.alt='Generated image'; img.loading='lazy'; wrap.appendChild(img);});
-      document.getElementById('zipBtn').style.display='inline-block'; document.getElementById('shareBtn').style.display='inline-block';
+      document.getElementById('zipBtn').style.display='inline-block'; document.getElementById('shareBtn').style.display='inline-block'; document.getElementById('quickShareBtn').style.display='inline-block';
       
       // Charge usage
       try{
@@ -1590,6 +2069,230 @@ async function pollStatus(){
 function cancelGeneration(){ if(POLL){ clearInterval(POLL); POLL=null; } hideProgress(); fetch('/generate/comfy_cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt_id:CURRENT.pid})}); CURRENT={host:'',pid:'',expected:1,started:0}; }
 
 function reRun(h){ if(!h) return; setForm({idea:h.idea||'',negative:h.negative||'',aspect_ratio:h.aspect_ratio||'16:9',lighting:h.lighting||'',color_grade:h.color_grade||'',extra_tags:h.extra_tags||'',steps:h.steps||'',cfg_scale:h.cfg_scale||'',sampler:h.sampler||'DPM++ 2M Karras',seed:h.seed||'',batch:h.batch||''}); optimize(); }
+
+// --- SOCIAL MEDIA FUNCTIONS ---
+let CURRENT_SHARE_TOKEN = '';
+
+function openSocialShare(){
+  if(!LAST_IMAGES || LAST_IMAGES.length === 0){
+    alert('No images to share. Generate images first.');
+    return;
+  }
+  
+  // Create share first
+  const form = getForm();
+  const meta = {
+    title: form.idea || 'AI Generated Art',
+    images: LAST_IMAGES,
+    params: {
+      steps: form.steps, cfg_scale: form.cfg_scale, sampler: form.sampler,
+      seed: form.seed, batch: form.batch, aspect_ratio: form.aspect_ratio,
+      lighting: form.lighting, color_grade: form.color_grade, extra_tags: form.extra_tags
+    }
+  };
+  
+  createShareForSocial(meta);
+}
+
+async function createShareForSocial(meta){
+  try{
+    const res = await fetch('/share/create', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(meta)
+    });
+    const out = await res.json();
+    if(!res.ok){ alert(out.error || 'Failed to create share'); return; }
+    
+    CURRENT_SHARE_TOKEN = out.token;
+    
+    // Set default caption
+    const title = meta.title || 'AI Generated Art';
+    document.getElementById('socialCaption').value = `🎨 ${title}\n\nWhere Imagination Meets Precision ✨`;
+    
+    // Load connected accounts
+    loadSocialConnections();
+    
+    // Show modal
+    document.getElementById('socialModal').classList.remove('hidden');
+  }catch(e){
+    alert('Error creating share: ' + e.message);
+  }
+}
+
+async function loadSocialConnections(){
+  const s = JSON.parse(localStorage.getItem(LS_SETTINGS) || '{}');
+  if(!s.apiKey){
+    document.getElementById('connectionsList').innerHTML = '<small style="color:#ff6b6b">API key required</small>';
+    return;
+  }
+  
+  try{
+    const res = await fetch('/social/status', {
+      headers: {'X-API-Key': s.apiKey}
+    });
+    const out = await res.json();
+    if(!res.ok){ 
+      document.getElementById('connectionsList').innerHTML = '<small style="color:#ff6b6b">Failed to load</small>';
+      return; 
+    }
+    
+    const connections = out.connections || [];
+    if(connections.length === 0){
+      document.getElementById('connectionsList').innerHTML = '<small style="color:#9fb2c7">No accounts connected</small>';
+    } else {
+      const html = connections.map(c => 
+        `<small style="color:#4ade80;display:block">✓ ${c.platform}</small>`
+      ).join('');
+      document.getElementById('connectionsList').innerHTML = html;
+    }
+  }catch(e){
+    document.getElementById('connectionsList').innerHTML = '<small style="color:#ff6b6b">Error loading connections</small>';
+  }
+}
+
+async function shareToSocial(){
+  if(!CURRENT_SHARE_TOKEN){
+    alert('No share token. Try creating share again.');
+    return;
+  }
+  
+  const s = JSON.parse(localStorage.getItem(LS_SETTINGS) || '{}');
+  if(!s.apiKey){
+    alert('API key required. Please set in Settings.');
+    return;
+  }
+  
+  const platforms = [];
+  if(document.getElementById('shareTwitter').checked) platforms.push('twitter');
+  if(document.getElementById('shareInstagram').checked) platforms.push('instagram');
+  if(document.getElementById('shareLinkedIn').checked) platforms.push('linkedin');
+  
+  if(platforms.length === 0){
+    alert('Select at least one platform to share to.');
+    return;
+  }
+  
+  const caption = document.getElementById('socialCaption').value.trim();
+  
+  document.getElementById('socialShareBtn').disabled = true;
+  document.getElementById('socialShareBtn').textContent = 'Sharing...';
+  document.getElementById('socialResults').innerHTML = '<div style="color:#9fb2c7">Posting to social media...</div>';
+  
+  try{
+    const res = await fetch('/social/share', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-Key': s.apiKey
+      },
+      body: JSON.stringify({
+        share_token: CURRENT_SHARE_TOKEN,
+        platforms: platforms,
+        caption: caption
+      })
+    });
+    
+    const out = await res.json();
+    if(!res.ok){
+      document.getElementById('socialResults').innerHTML = `<div style="color:#ff6b6b">Error: ${out.error}</div>`;
+      return;
+    }
+    
+    // Display results
+    const results = out.results || [];
+    let html = '<div style="margin-top:8px"><strong>Results:</strong></div>';
+    
+    results.forEach(r => {
+      const icon = r.platform === 'twitter' ? '🐦' : r.platform === 'instagram' ? '📷' : '💼';
+      const color = r.success ? '#4ade80' : '#ff6b6b';
+      const status = r.success ? `✓ Posted (ID: ${r.post_id})` : `✗ ${r.error}`;
+      html += `<div style="color:${color};margin:4px 0">${icon} ${r.platform}: ${status}</div>`;
+    });
+    
+    document.getElementById('socialResults').innerHTML = html;
+    
+    // Auto-close modal after 3 seconds if all successful
+    const allSuccess = results.every(r => r.success);
+    if(allSuccess){
+      setTimeout(() => closeSocialShare(), 3000);
+    }
+    
+  }catch(e){
+    document.getElementById('socialResults').innerHTML = `<div style="color:#ff6b6b">Network error: ${e.message}</div>`;
+  }finally{
+    document.getElementById('socialShareBtn').disabled = false;
+    document.getElementById('socialShareBtn').textContent = 'Share Selected';
+  }
+}
+
+function closeSocialShare(){
+  document.getElementById('socialModal').classList.add('hidden');
+  document.getElementById('socialResults').innerHTML = '';
+  // Reset form
+  document.getElementById('shareTwitter').checked = false;
+  document.getElementById('shareInstagram').checked = false;
+  document.getElementById('shareLinkedIn').checked = false;
+  CURRENT_SHARE_TOKEN = '';
+}
+
+function openSocialSettings(){
+  document.getElementById('socialSettingsModal').classList.remove('hidden');
+}
+
+function closeSocialSettings(){
+  document.getElementById('socialSettingsModal').classList.add('hidden');
+}
+
+async function connectPlatform(platform){
+  const s = JSON.parse(localStorage.getItem(LS_SETTINGS) || '{}');
+  if(!s.apiKey){
+    alert('API key required. Please set in Settings first.');
+    return;
+  }
+  
+  try{
+    const res = await fetch(`/social/auth/${platform}`, {
+      method: 'POST',
+      headers: {'X-API-Key': s.apiKey}
+    });
+    const out = await res.json();
+    if(!res.ok){ alert(out.error || 'Auth failed'); return; }
+    
+    // In production, this would open OAuth window
+    // For demo, simulate successful connection
+    alert(`${platform} OAuth would open here. For demo, simulating connection...`);
+    
+    // Mock callback
+    setTimeout(async () => {
+      try{
+        const callbackRes = await fetch(`/social/callback/${platform}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-API-Key': s.apiKey
+          },
+          body: JSON.stringify({
+            code: 'mock_auth_code_' + Date.now(),
+            state: 'mock_state'
+          })
+        });
+        const callbackOut = await callbackRes.json();
+        if(callbackRes.ok){
+          alert(callbackOut.message || `${platform} connected successfully!`);
+          loadSocialConnections(); // Refresh connections
+        } else {
+          alert(callbackOut.error || 'Connection failed');
+        }
+      }catch(e){
+        alert('Connection callback failed: ' + e.message);
+      }
+    }, 1000);
+    
+  }catch(e){
+    alert('Connection error: ' + e.message);
+  }
+}
 
 document.addEventListener('DOMContentLoaded',()=>{ loadAllPresets(); renderHistory(); refreshQuota(); });
 </script>

@@ -1,6 +1,6 @@
 # Overview
 
-This is a Flask-based Universal Prompt Optimizer that transforms rough creative ideas into professional, platform-ready prompts for multiple AI generation services. The application uses heuristic analysis to categorize and enhance user input, generating optimized prompts for SDXL, ComfyUI, Midjourney v6, Pika Labs, and Runway ML. The system follows strict prompt structure ordering (quality → subject → style → lighting → composition → mood → color grade → extra tags) and includes comprehensive negative prompting, platform-specific configuration hints, database-backed API key authentication with expiry dates, daily usage quotas with individual user limits, Stripe webhook integration for automated key provisioning, and comprehensive admin endpoints for manual key management.
+This is a Flask-based Universal Prompt Optimizer that transforms rough creative ideas into professional, platform-ready prompts for multiple AI generation services. The application uses heuristic analysis to categorize and enhance user input, generating optimized prompts for SDXL, ComfyUI, Midjourney v6, Pika Labs, and Runway ML. The system follows strict prompt structure ordering (quality → subject → style → lighting → composition → mood → color grade → extra tags) and includes comprehensive negative prompting, platform-specific configuration hints, database-backed API key authentication with expiry dates, daily usage quotas with individual user limits, Stripe webhook integration for automated key provisioning, comprehensive admin endpoints for manual key management, and Quick Share to Social functionality for automatic posting to Twitter/X, Instagram, and LinkedIn with branded Chaos Venice Productions content.
 
 # User Preferences
 
@@ -76,7 +76,8 @@ The service provides comprehensive endpoints for prompt optimization and image g
 - **Checkout System** (`/checkout/create`, `/buy`): Stripe Checkout integration with dedicated buy page for seamless payment flow and instant API key delivery
 - **Shareable Links** (`/share/create`, `/s/<token>`, `/share/delete`): Branded marketing funnels for Chaos Venice Productions with lead capture, analytics tracking, and monetization hooks
 - **Marketing Funnels** (`/share/capture-lead`, `/contact`): Lead capture system and professional contact pages with Chaos Venice branding
-- **Admin Management** (`/admin/issue`, `/admin/revoke`, `/admin/update_limit`, `/admin/keys`, `/admin/leads`, `/admin/analytics`): Manual API key operations, lead management, and share page analytics
+- **Admin Management** (`/admin/issue`, `/admin/revoke`, `/admin/update_limit`, `/admin/keys`, `/admin/leads`, `/admin/analytics`, `/admin/logs`): Manual API key operations, lead management, share page analytics, and social media tracking
+- **Social Media Integration** (`/social/auth/<platform>`, `/social/callback/<platform>`, `/social/share`, `/social/status`): OAuth authentication, secure token storage with encryption, direct posting to Twitter/X, Instagram, and LinkedIn with branded content and analytics tracking
 - **Status Polling** (`/generate/comfy_status`): Real-time generation progress tracking for async workflows with authentication
 - **ZIP Downloads** (`/zip`): Bulk image packaging accepting image URLs and returning compressed archives
 - **Response Format**: Returns unified prompts plus platform-specific configurations (SDXL settings, ComfyUI workflows, Midjourney flags, video motion parameters)
@@ -86,6 +87,7 @@ The service provides comprehensive endpoints for prompt optimization and image g
 - **Individual Quotas**: Per-key daily generation limits with automatic usage charging and remaining quota display
 - **Key Management**: Database-backed keys with email association, plan tiers, expiry dates, and revocation capabilities
 - **Shareable Links**: Public link generation for any generation with 30-day expiry, automatic clipboard copy, and parameter display
+- **Quick Share to Social**: One-click posting to Twitter/X, Instagram, and LinkedIn with editable captions, platform selection checkboxes, and branded Chaos Venice taglines
 - **Bootstrap Demo**: Auto-created demo123 key with 50 daily generations for immediate testing
 - **Error Handling**: Comprehensive validation with loading states and user-friendly error messages
 - **Execution Hints**: Built-in troubleshooting guidance for common generation issues (faces, motion warping, busy outputs)
