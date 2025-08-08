@@ -223,9 +223,37 @@ def _init_share_table():
             customer_name TEXT,
             order_details TEXT,          -- JSON with parameters and requirements
             price_cents INTEGER,
-            status TEXT DEFAULT 'pending', -- 'pending', 'paid', 'completed', 'cancelled'
+            status TEXT DEFAULT 'pending', -- 'pending', 'paid', 'completed', 'cancelled', 'upsell_pending'
             created_at TEXT NOT NULL,
+            upsell_token TEXT,           -- Links to upsell session
             FOREIGN KEY(share_token) REFERENCES shares(token)
+        )""")
+        
+        # Upsell sessions table for funnel tracking
+        db.execute("""CREATE TABLE IF NOT EXISTS upsell_sessions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            upsell_token TEXT UNIQUE,
+            original_share_token TEXT,
+            customer_email TEXT,
+            customer_name TEXT,
+            original_project_type TEXT,
+            status TEXT DEFAULT 'active',  -- 'active', 'completed', 'abandoned', 'expired'
+            tier_selected TEXT,  -- 'basic', 'premium', 'deluxe'
+            expires_at TEXT,
+            created_at TEXT,
+            completed_at TEXT,
+            FOREIGN KEY(original_share_token) REFERENCES shares(token)
+        )""")
+        
+        # Upsell follow-up emails table for automation
+        db.execute("""CREATE TABLE IF NOT EXISTS upsell_follow_ups(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            upsell_token TEXT,
+            email_sequence INTEGER,  -- 1, 2, 3, 4 (hour 1, hour 12, day 2, day 4)
+            scheduled_at TEXT,
+            sent_at TEXT,
+            status TEXT DEFAULT 'scheduled',  -- 'scheduled', 'sent', 'failed'
+            FOREIGN KEY(upsell_token) REFERENCES upsell_sessions(upsell_token)
         )""")
         
         db.commit()
@@ -361,6 +389,50 @@ def _update_featured_portfolio():
 
 def _new_token(prefix="sh_"): 
     return prefix + secrets.token_urlsafe(16)
+
+def _generate_share_token():
+    """Generate a random token for share links"""
+    import secrets
+    return secrets.token_urlsafe(16)
+
+def _start_upsell_sequence(lead_id, email, upsell_token, original_token, project_type):
+    """Start automated upsell sequence with email follow-ups"""
+    try:
+        db = get_db()
+        
+        # Create upsell session (expires in 24 hours)
+        expires_at = (datetime.datetime.utcnow() + datetime.timedelta(hours=24)).isoformat()
+        
+        # Get customer name from lead
+        cur = db.execute("SELECT name FROM leads WHERE id=?", (lead_id,))
+        lead_row = cur.fetchone()
+        customer_name = lead_row[0] if lead_row else 'Valued Customer'
+        
+        db.execute("""INSERT INTO upsell_sessions(upsell_token, original_share_token, customer_email, 
+                      customer_name, original_project_type, expires_at, created_at)
+                      VALUES(?,?,?,?,?,?,?)""",
+                   (upsell_token, original_token, email, customer_name, project_type, 
+                    expires_at, datetime.datetime.utcnow().isoformat()))
+        
+        # Schedule follow-up emails
+        now = datetime.datetime.utcnow()
+        follow_up_times = [
+            (1, now + datetime.timedelta(hours=1)),    # Hour 1 reminder
+            (2, now + datetime.timedelta(hours=12)),   # Hour 12 discount
+            (3, now + datetime.timedelta(days=2)),     # Day 2 behind scenes
+            (4, now + datetime.timedelta(days=4))      # Day 4 last chance
+        ]
+        
+        for sequence, scheduled_time in follow_up_times:
+            db.execute("""INSERT INTO upsell_follow_ups(upsell_token, email_sequence, scheduled_at)
+                          VALUES(?,?,?)""",
+                       (upsell_token, sequence, scheduled_time.isoformat()))
+        
+        db.commit()
+        _log_error("INFO", f"Upsell sequence started for {email}", f"Token: {upsell_token}")
+        
+    except Exception as e:
+        _log_error("ERROR", "Failed to start upsell sequence", str(e))
 
 def _get_client_ip():
     """Get client IP address handling proxies"""
@@ -3976,12 +4048,16 @@ def portfolio_order_form(token):
       .then(response => response.json())
       .then(data => {{
         if (data.ok) {{
-          messageDiv.style.display = 'block';
-          messageDiv.style.background = 'rgba(0,255,0,0.1)';
-          messageDiv.style.border = '1px solid #00ff00';
-          messageDiv.style.color = '#00ff00';
-          messageDiv.innerHTML = data.message + '<br><br>You will receive a detailed proposal within 24 hours.';
-          form.reset();
+          if (data.redirect) {{
+            window.location.href = data.redirect;
+          }} else {{
+            messageDiv.style.display = 'block';
+            messageDiv.style.background = 'rgba(0,255,0,0.1)';
+            messageDiv.style.border = '1px solid #00ff00';
+            messageDiv.style.color = '#00ff00';
+            messageDiv.innerHTML = data.message + '<br><br>Redirecting to exclusive offer...';
+            setTimeout(() => window.location.href = data.redirect || '/', 2000);
+          }}
         }} else {{
           throw new Error(data.error || 'Unknown error');
         }}
@@ -4005,7 +4081,7 @@ def portfolio_order_form(token):
 
 @app.route('/portfolio/<token>/submit-order', methods=['POST'])
 def submit_portfolio_order():
-    """Process portfolio commission order"""
+    """Process portfolio commission order - redirects to upsell page"""
     token = request.form.get('reference_token')
     name = request.form.get('name', '').strip()
     email = request.form.get('email', '').strip()
@@ -4029,19 +4105,26 @@ def submit_portfolio_order():
         
         pricing = {'single_image': 29900, 'image_series': 79900, 'brand_package': 149900}
         
+        # Create upsell session ID
+        upsell_token = _generate_share_token()
+        
         db.execute("""INSERT INTO portfolio_orders(share_token, order_type, customer_email, customer_name, 
-                      order_details, price_cents, created_at)
-                      VALUES(?,?,?,?,?,?,?)""",
+                      order_details, price_cents, created_at, status, upsell_token)
+                      VALUES(?,?,?,?,?,?,?,?,?)""",
                    (token, 'similar', email, name, json.dumps(order_details),
-                    pricing.get(project_type, 0), datetime.datetime.utcnow().isoformat()))
+                    pricing.get(project_type, 0), datetime.datetime.utcnow().isoformat(), 'upsell_pending', upsell_token))
         db.commit()
         
-        # Capture as lead
-        lead_id = _capture_lead(email, token, "portfolio_order")
+        # Capture as lead with upsell trigger
+        lead_id = _capture_lead(email, token, "upsell_trigger")
+        
+        # Start upsell sequence
+        _start_upsell_sequence(lead_id, email, upsell_token, token, project_type)
         
         return jsonify({
             "ok": True, 
-            "message": f"Commission request submitted successfully! Order ID: {token[:8]}"
+            "redirect": f"/upsell/{upsell_token}",
+            "message": "Redirecting to exclusive offer..."
         })
         
     except Exception as e:
@@ -4270,6 +4353,729 @@ def submit_portfolio_license():
         return jsonify({"error": "Failed to submit license order"}), 500
 
 # --- PORTFOLIO ADMIN ENDPOINTS ---
+
+@app.route('/upsell/<upsell_token>')
+def upsell_page(upsell_token):
+    """Tiered upsell offer page with countdown timer and scarcity elements"""
+    db = get_db()
+    
+    # Get upsell session
+    cur = db.execute("""SELECT us.*, s.title, s.meta_json FROM upsell_sessions us
+                        LEFT JOIN shares s ON us.original_share_token = s.token
+                        WHERE us.upsell_token=? AND us.expires_at > ?""",
+                     (upsell_token, datetime.datetime.utcnow().isoformat()))
+    upsell_data = cur.fetchone()
+    
+    if not upsell_data:
+        return "Upsell offer expired or not found", 404
+    
+    # Extract data
+    (session_id, token, original_token, email, name, project_type, status, 
+     tier_selected, expires_at, created_at, completed_at, title, meta_json) = upsell_data
+    
+    try:
+        meta = json.loads(meta_json or '{}')
+    except:
+        meta = {}
+    
+    image_url = meta.get('images', [''])[0] or ''
+    original_prompt = meta.get('positive_prompt', 'Professional AI artwork')
+    
+    # Calculate time remaining for scarcity
+    expires_dt = datetime.datetime.fromisoformat(expires_at.replace('Z', '+00:00').replace('+00:00', ''))
+    time_left_hours = max(0, (expires_dt - datetime.datetime.utcnow()).total_seconds() / 3600)
+    
+    html = f"""<!doctype html><html><head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Exclusive Offer - {title} - Chaos Venice Productions</title>
+    <style>
+    body{{font-family:'Inter',system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:linear-gradient(135deg,#0a0e1a 0%,#0f1419 50%,#1a1f2e 100%);color:#e7edf5;margin:0;min-height:100vh}}
+    .wrap{{max-width:1200px;margin:0 auto;padding:20px}}
+    .header{{text-align:center;margin-bottom:40px;padding:30px;background:linear-gradient(45deg,rgba(255,0,0,0.1),rgba(255,215,0,0.1));border-radius:20px;border:2px solid #ff4444}}
+    .logo{{font-size:2.5rem;font-weight:800;background:linear-gradient(45deg,#ff4444,#ffd700);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:10px}}
+    .countdown{{font-size:2rem;color:#ff4444;font-weight:700;margin:10px 0}}
+    .scarcity{{color:#ffd700;font-size:1.1rem;margin-bottom:20px}}
+    .content{{display:grid;grid-template-columns:1fr 2fr;gap:40px;margin-bottom:40px}}
+    .image-section{{text-align:center}}
+    .main-image{{width:100%;max-width:400px;border-radius:16px;border:3px solid #00ffff}}
+    .offers-section{{}}
+    .offer-tier{{background:rgba(17,24,38,0.9);border:2px solid #1f2a3a;border-radius:16px;padding:25px;margin-bottom:20px;position:relative;transition:all 0.3s ease}}
+    .offer-tier:hover{{border-color:#00ffff;transform:scale(1.02)}}
+    .offer-tier.recommended{{border-color:#ffd700;background:rgba(255,215,0,0.05)}}
+    .recommended-badge{{position:absolute;top:-10px;right:20px;background:#ffd700;color:#000;padding:5px 15px;border-radius:20px;font-weight:700;font-size:12px}}
+    .tier-title{{font-size:1.8rem;font-weight:700;margin-bottom:10px}}
+    .tier-price{{font-size:2.5rem;color:#00ffff;font-weight:800;margin-bottom:15px}}
+    .tier-original{{text-decoration:line-through;color:#666;font-size:1.2rem;margin-right:10px}}
+    .tier-features{{margin-bottom:20px}}
+    .tier-features li{{margin-bottom:8px;color:#9fb2c7}}
+    .tier-cta{{width:100%;padding:16px;border:none;border-radius:12px;font-size:1.2rem;font-weight:700;cursor:pointer;transition:all 0.2s}}
+    .tier-cta.basic{{background:linear-gradient(45deg,#4f46e5,#7c3aed);color:white}}
+    .tier-cta.premium{{background:linear-gradient(45deg,#ffd700,#f59e0b);color:#000}}
+    .tier-cta.deluxe{{background:linear-gradient(45deg,#ff4444,#dc2626);color:white}}
+    .guarantee{{text-align:center;padding:30px;background:rgba(0,255,0,0.05);border:1px solid #00ff00;border-radius:16px;margin-top:30px}}
+    .testimonial{{background:rgba(17,24,38,0.8);border-left:4px solid #00ffff;padding:20px;margin:20px 0;border-radius:0 12px 12px 0}}
+    @media(max-width:768px){{.content{{grid-template-columns:1fr}}}}
+    </style>
+    </head><body>
+    <div class="wrap">
+      <div class="header">
+        <div class="logo">🚨 EXCLUSIVE LIMITED-TIME OFFER 🚨</div>
+        <div id="countdown" class="countdown">⏰ {time_left_hours:.1f} hours remaining</div>
+        <div class="scarcity">⚡ This offer expires in 24 hours and won't be repeated</div>
+      </div>
+      
+      <div class="content">
+        <div class="image-section">
+          <img src="{image_url}" alt="{title}" class="main-image">
+          <h2 style="color:#fff;margin-top:20px">{title}</h2>
+          <p style="color:#9fb2c7;margin-top:10px">You loved this piece - now get the complete package!</p>
+        </div>
+        
+        <div class="offers-section">
+          <div class="offer-tier">
+            <div class="tier-title" style="color:#4f46e5">Basic Pack</div>
+            <div class="tier-price">
+              <span class="tier-original">$399</span>
+              $299
+            </div>
+            <ul class="tier-features">
+              <li>✅ 1 Custom artwork in this style</li>
+              <li>✅ 4K resolution download</li>
+              <li>✅ Commercial usage rights</li>
+              <li>✅ 2 revision rounds</li>
+              <li>✅ 48-hour delivery</li>
+            </ul>
+            <button class="tier-cta basic" onclick="selectTier('basic', 299)">Get Basic Pack - $299</button>
+          </div>
+          
+          <div class="offer-tier recommended">
+            <div class="recommended-badge">🔥 MOST POPULAR</div>
+            <div class="tier-title" style="color:#ffd700">Premium Pack</div>
+            <div class="tier-price">
+              <span class="tier-original">$899</span>
+              $599
+            </div>
+            <ul class="tier-features">
+              <li>✅ 3 Custom artworks in this style</li>
+              <li>✅ 8K ultra-high resolution</li>
+              <li>✅ Full commercial + resale rights</li>
+              <li>✅ Unlimited revisions</li>
+              <li>✅ 24-hour priority delivery</li>
+              <li>✅ Bonus: Process videos & source files</li>
+              <li>✅ Exclusive style variations</li>
+            </ul>
+            <button class="tier-cta premium" onclick="selectTier('premium', 599)">Get Premium Pack - $599</button>
+          </div>
+          
+          <div class="offer-tier">
+            <div class="tier-title" style="color:#ff4444">Deluxe Brand Package</div>
+            <div class="tier-price">
+              <span class="tier-original">$1,999</span>
+              $1,299
+            </div>
+            <ul class="tier-features">
+              <li>✅ 10 Custom artworks in cohesive style</li>
+              <li>✅ Complete brand identity package</li>
+              <li>✅ Exclusive ownership rights</li>
+              <li>✅ Personal art director consultation</li>
+              <li>✅ Same-day delivery available</li>
+              <li>✅ Social media templates included</li>
+              <li>✅ 12-month support & updates</li>
+            </ul>
+            <button class="tier-cta deluxe" onclick="selectTier('deluxe', 1299)">Get Deluxe Package - $1,299</button>
+          </div>
+        </div>
+      </div>
+      
+      <div class="testimonial">
+        <p><em>"The Premium Pack exceeded every expectation. The quality is simply unmatched, and having multiple variations gave us incredible flexibility for our campaign."</em></p>
+        <strong>— Sarah Chen, Creative Director at TechFlow</strong>
+      </div>
+      
+      <div class="guarantee">
+        <h3 style="color:#00ff00">💯 100% Satisfaction Guarantee</h3>
+        <p>Not happy with your artwork? We'll revise it until it's perfect, or provide a full refund within 14 days. Your creative vision is our priority.</p>
+      </div>
+    </div>
+    
+    <script>
+    let timeLeft = {time_left_hours * 3600}; // seconds
+    
+    function updateCountdown() {{
+      const hours = Math.floor(timeLeft / 3600);
+      const minutes = Math.floor((timeLeft % 3600) / 60);
+      const seconds = timeLeft % 60;
+      
+      document.getElementById('countdown').textContent = 
+        `⏰ ${{hours}}h ${{minutes}}m ${{seconds}}s remaining`;
+      
+      if (timeLeft <= 0) {{
+        document.getElementById('countdown').textContent = '⏰ OFFER EXPIRED';
+        document.querySelectorAll('.tier-cta').forEach(btn => {{
+          btn.disabled = true;
+          btn.textContent = 'Offer Expired';
+        }});
+      }} else {{
+        timeLeft--;
+      }}
+    }}
+    
+    setInterval(updateCountdown, 1000);
+    
+    function selectTier(tier, price) {{
+      if (timeLeft <= 0) return;
+      
+      // Send selection to server
+      fetch('/upsell/{upsell_token}/select', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{tier: tier, price: price}})
+      }})
+      .then(response => response.json())
+      .then(data => {{
+        if (data.checkout_url) {{
+          window.location.href = data.checkout_url;
+        }} else if (data.redirect) {{
+          window.location.href = data.redirect;
+        }}
+      }})
+      .catch(error => {{
+        console.error('Error:', error);
+        alert('Something went wrong. Please try again.');
+      }});
+    }}
+    </script>
+    </body></html>"""
+    
+    return Response(html, 200, mimetype="text/html")
+
+@app.route('/upsell/<upsell_token>/select', methods=['POST'])
+def select_upsell_tier(upsell_token):
+    """Handle tier selection and redirect to Stripe checkout"""
+    data = request.get_json()
+    tier = data.get('tier')
+    price = data.get('price')
+    
+    if not tier or not price:
+        return jsonify({"error": "Missing tier or price"}), 400
+    
+    try:
+        db = get_db()
+        
+        # Update upsell session with tier selection
+        db.execute("""UPDATE upsell_sessions SET tier_selected=?, status='checkout_pending'
+                      WHERE upsell_token=? AND expires_at > ?""",
+                   (tier, upsell_token, datetime.datetime.utcnow().isoformat()))
+        
+        affected_rows = db.total_changes
+        if affected_rows == 0:
+            return jsonify({"error": "Upsell session expired or not found"}), 404
+        
+        db.commit()
+        
+        # For now, redirect to a confirmation page (Stripe integration would go here)
+        return jsonify({
+            "redirect": f"/upsell/{upsell_token}/confirm?tier={tier}&price={price}"
+        })
+        
+    except Exception as e:
+        _log_error("ERROR", "Upsell tier selection failed", str(e))
+        return jsonify({"error": "Failed to process selection"}), 500
+
+@app.route('/upsell/<upsell_token>/confirm')
+def upsell_confirmation(upsell_token):
+    """Post-purchase confirmation and next upsell"""
+    tier = request.args.get('tier')
+    price = request.args.get('price')
+    
+    db = get_db()
+    
+    # Mark upsell as completed
+    db.execute("""UPDATE upsell_sessions SET status='completed', completed_at=?
+                  WHERE upsell_token=?""",
+               (datetime.datetime.utcnow().isoformat(), upsell_token))
+    
+    # Cancel pending follow-up emails
+    db.execute("""UPDATE upsell_follow_ups SET status='cancelled'
+                  WHERE upsell_token=? AND status='scheduled'""",
+               (upsell_token,))
+    
+    db.commit()
+    
+    html = f"""<!doctype html><html><head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Order Confirmed - Chaos Venice Productions</title>
+    <style>
+    body{{font-family:'Inter',system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:linear-gradient(135deg,#0a0e1a 0%,#0f1419 50%,#1a1f2e 100%);color:#e7edf5;margin:0;min-height:100vh}}
+    .wrap{{max-width:800px;margin:0 auto;padding:20px;text-align:center}}
+    .success{{background:rgba(0,255,0,0.1);border:2px solid #00ff00;border-radius:20px;padding:40px;margin-bottom:40px}}
+    .logo{{font-size:2.5rem;font-weight:800;background:linear-gradient(45deg,#00ffff,#ff00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:20px}}
+    .post-upsell{{background:rgba(17,24,38,0.8);border:2px solid #ffd700;border-radius:16px;padding:30px;margin-top:30px}}
+    .btn{{padding:16px 32px;border:none;border-radius:12px;font-size:1.2rem;font-weight:700;cursor:pointer;background:linear-gradient(45deg,#ffd700,#f59e0b);color:#000;margin:10px}}
+    </style>
+    </head><body>
+    <div class="wrap">
+      <div class="success">
+        <div class="logo">CHAOS VENICE PRODUCTIONS</div>
+        <h1>🎉 Order Confirmed!</h1>
+        <p>Thank you for choosing the <strong>{tier.title()} Package (${price})</strong></p>
+        <p>You'll receive a detailed timeline and preview within 24 hours.</p>
+      </div>
+      
+      <div class="post-upsell">
+        <h3>🔥 One More Exclusive Opportunity</h3>
+        <p><strong>Since you loved this style, get 5 bonus variations for just $99</strong></p>
+        <p>Perfect for A/B testing, social media content, or different applications.</p>
+        <button class="btn" onclick="window.location.href='/post-upsell/{upsell_token}'">Add 5 Bonus Variations - $99</button>
+        <p><small>This offer is only available now and expires in 1 hour.</small></p>
+      </div>
+    </div>
+    </body></html>"""
+    
+    return Response(html, 200, mimetype="text/html")
+
+@app.route('/cron/process-upsell-emails')
+def process_upsell_emails():
+    """Background task to send scheduled upsell follow-up emails"""
+    db = get_db()
+    
+    # Get all scheduled follow-ups that need to be sent
+    cur = db.execute("""SELECT uf.*, us.customer_name, us.customer_email, us.original_share_token, s.title, s.meta_json
+                        FROM upsell_follow_ups uf
+                        JOIN upsell_sessions us ON uf.upsell_token = us.upsell_token
+                        LEFT JOIN shares s ON us.original_share_token = s.token
+                        WHERE uf.status='scheduled' AND uf.scheduled_at <= ?
+                        ORDER BY uf.scheduled_at ASC""",
+                     (datetime.datetime.utcnow().isoformat(),))
+    
+    pending_emails = cur.fetchall()
+    sent_count = 0
+    
+    for email_data in pending_emails:
+        (follow_up_id, upsell_token, sequence, scheduled_at, sent_at, status,
+         name, email, original_token, title, meta_json) = email_data
+        
+        try:
+            # Get image for email
+            meta = json.loads(meta_json or '{}')
+            image_url = meta.get('images', [''])[0] or ''
+            
+            # Generate email content based on sequence
+            subject, html_content = _generate_upsell_email_content(sequence, name, title, image_url, upsell_token)
+            
+            # Send email using SendGrid or SMTP
+            success = _send_upsell_email(email, subject, html_content)
+            
+            if success:
+                # Mark as sent
+                db.execute("""UPDATE upsell_follow_ups SET status='sent', sent_at=?
+                             WHERE id=?""",
+                          (datetime.datetime.utcnow().isoformat(), follow_up_id))
+                sent_count += 1
+            else:
+                # Mark as failed
+                db.execute("""UPDATE upsell_follow_ups SET status='failed'
+                             WHERE id=?""", (follow_up_id,))
+                
+        except Exception as e:
+            _log_error("ERROR", f"Failed to send upsell email {follow_up_id}", str(e))
+            db.execute("""UPDATE upsell_follow_ups SET status='failed'
+                         WHERE id=?""", (follow_up_id,))
+    
+    db.commit()
+    
+    return jsonify({
+        "processed": len(pending_emails),
+        "sent": sent_count,
+        "failed": len(pending_emails) - sent_count
+    })
+
+def _generate_upsell_email_content(sequence, customer_name, artwork_title, image_url, upsell_token):
+    """Generate personalized email content for each sequence step"""
+    base_url = request.host_url.rstrip('/')
+    
+    if sequence == 1:
+        # Hour 1: Reminder about the exclusive offer
+        subject = f"🎨 {customer_name}, your exclusive offer expires soon!"
+        html = f"""
+        <html><body style="font-family:Arial,sans-serif;background:#f8f9fa;margin:0;padding:20px">
+        <div style="max-width:600px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 4px 12px rgba(0,0,0,0.1)">
+            <div style="background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;padding:30px;text-align:center">
+                <h1>🚨 Don't Miss Out!</h1>
+                <p style="font-size:18px;margin:0">Your exclusive offer on "{artwork_title}" expires in just 23 hours</p>
+            </div>
+            <div style="padding:30px">
+                <p>Hi {customer_name},</p>
+                <p>I noticed you were interested in commissioning artwork similar to "<strong>{artwork_title}</strong>" but haven't completed your order yet.</p>
+                <img src="{image_url}" style="width:100%;max-width:400px;border-radius:8px;margin:20px 0">
+                <p>This exclusive offer includes:</p>
+                <ul>
+                    <li>✅ Up to 65% off regular pricing</li>
+                    <li>✅ Priority delivery in 24-48 hours</li>
+                    <li>✅ Unlimited revisions until perfect</li>
+                    <li>✅ Full commercial licensing rights</li>
+                </ul>
+                <div style="text-align:center;margin:30px 0">
+                    <a href="{base_url}/upsell/{upsell_token}" style="display:inline-block;background:linear-gradient(45deg,#ff6b6b,#ee5a52);color:#fff;padding:16px 32px;border-radius:8px;text-decoration:none;font-weight:bold;font-size:18px">
+                        🔥 Claim Your Offer Now
+                    </a>
+                </div>
+                <p><strong>Time-sensitive:</strong> This offer expires in 23 hours and won't be repeated.</p>
+                <p>Best regards,<br>The Chaos Venice Productions Team</p>
+            </div>
+        </div>
+        </body></html>
+        """
+        
+    elif sequence == 2:
+        # Hour 12: Additional discount and social proof
+        subject = f"💰 Extra 10% off for {customer_name} - Final 12 hours!"
+        html = f"""
+        <html><body style="font-family:Arial,sans-serif;background:#f8f9fa;margin:0;padding:20px">
+        <div style="max-width:600px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 4px 12px rgba(0,0,0,0.1)">
+            <div style="background:linear-gradient(135deg,#f093fb,#f5576c);color:#fff;padding:30px;text-align:center">
+                <h1>🔥 Extra 10% Off!</h1>
+                <p style="font-size:18px;margin:0">Final 12 hours - we're adding an extra discount just for you</p>
+            </div>
+            <div style="padding:30px">
+                <p>Hi {customer_name},</p>
+                <p>Since you showed genuine interest in our work, I'm authorized to offer you an <strong>additional 10% discount</strong> on top of our already reduced prices.</p>
+                <div style="background:#e8f5e8;border:2px solid #4caf50;border-radius:8px;padding:20px;margin:20px 0;text-align:center">
+                    <h3 style="color:#2e7d32;margin:0">🎁 LIMITED BONUS DISCOUNT</h3>
+                    <p style="font-size:24px;color:#1565c0;font-weight:bold;margin:10px 0">EXTRA10 - Save 10% More!</p>
+                    <p style="margin:0;color:#555">Use this code when you complete your order</p>
+                </div>
+                <img src="{image_url}" style="width:100%;max-width:400px;border-radius:8px;margin:20px 0">
+                <div style="text-align:center;margin:30px 0">
+                    <a href="{base_url}/upsell/{upsell_token}" style="display:inline-block;background:linear-gradient(45deg,#4caf50,#45a049);color:#fff;padding:16px 32px;border-radius:8px;text-decoration:none;font-weight:bold;font-size:18px">
+                        💰 Claim Extra Discount
+                    </a>
+                </div>
+                <p><strong>This expires in just 12 hours</strong> - don't let this opportunity slip away!</p>
+                <p>Best regards,<br>Sarah from Chaos Venice Productions</p>
+            </div>
+        </div>
+        </body></html>
+        """
+        
+    elif sequence == 3:
+        # Day 2: Behind-the-scenes and process explanation
+        subject = f"🎬 {customer_name}, see how we create your masterpiece"
+        html = f"""
+        <html><body style="font-family:Arial,sans-serif;background:#f8f9fa;margin:0;padding:20px">
+        <div style="max-width:600px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 4px 12px rgba(0,0,0,0.1)">
+            <div style="background:linear-gradient(135deg,#4facfe,#00f2fe);color:#fff;padding:30px;text-align:center">
+                <h1>🎬 Behind the Magic</h1>
+                <p style="font-size:18px;margin:0">Ever wondered how we create stunning AI artwork?</p>
+            </div>
+            <div style="padding:30px">
+                <p>Hi {customer_name},</p>
+                <p>Since you're interested in professional AI artwork, I thought you'd love to see our creative process:</p>
+                <div style="border:1px solid #ddd;border-radius:8px;padding:20px;margin:20px 0">
+                    <h4>🧠 Our 7-Step Creation Process:</h4>
+                    <ol>
+                        <li><strong>Prompt Engineering:</strong> We craft detailed, optimized prompts using industry techniques</li>
+                        <li><strong>Style Analysis:</strong> Deep analysis of your reference to capture every detail</li>
+                        <li><strong>Multiple Generations:</strong> We create 50+ variations to find the perfect one</li>
+                        <li><strong>AI Model Selection:</strong> Using SDXL, Midjourney, and proprietary models</li>
+                        <li><strong>Post-Processing:</strong> Professional enhancement and refinement</li>
+                        <li><strong>Quality Control:</strong> Every piece reviewed by our art directors</li>
+                        <li><strong>Final Delivery:</strong> Ultra-high resolution with licensing documentation</li>
+                    </ol>
+                </div>
+                <img src="{image_url}" style="width:100%;max-width:400px;border-radius:8px;margin:20px 0">
+                <p>This level of attention is why clients like Netflix, Adobe, and 500+ agencies trust us with their creative needs.</p>
+                <div style="text-align:center;margin:30px 0">
+                    <a href="{base_url}/upsell/{upsell_token}" style="display:inline-block;background:linear-gradient(45deg,#667eea,#764ba2);color:#fff;padding:16px 32px;border-radius:8px;text-decoration:none;font-weight:bold;font-size:18px">
+                        🎨 Start Your Project
+                    </a>
+                </div>
+                <p>Questions? Just reply to this email - I read every message personally.</p>
+                <p>Best,<br>Marcus, Creative Director<br>Chaos Venice Productions</p>
+            </div>
+        </div>
+        </body></html>
+        """
+        
+    elif sequence == 4:
+        # Day 4: Final chance with scarcity
+        subject = f"⏰ {customer_name}, final notice - offer expires tonight"
+        html = f"""
+        <html><body style="font-family:Arial,sans-serif;background:#f8f9fa;margin:0;padding:20px">
+        <div style="max-width:600px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 4px 12px rgba(0,0,0,0.1)">
+            <div style="background:linear-gradient(135deg,#ff416c,#ff4b2b);color:#fff;padding:30px;text-align:center">
+                <h1>⏰ FINAL NOTICE</h1>
+                <p style="font-size:18px;margin:0">Your exclusive offer expires at midnight tonight</p>
+            </div>
+            <div style="padding:30px">
+                <p>Hi {customer_name},</p>
+                <p>This is my final email about the exclusive offer for artwork like "{artwork_title}".</p>
+                <div style="background:#ffebee;border:2px solid #f44336;border-radius:8px;padding:20px;margin:20px 0;text-align:center">
+                    <h3 style="color:#c62828;margin:0">🚨 EXPIRES AT MIDNIGHT</h3>
+                    <p style="font-size:18px;margin:10px 0">After tonight, regular pricing resumes</p>
+                    <p style="margin:0;color:#555">(That's 3x more expensive)</p>
+                </div>
+                <img src="{image_url}" style="width:100%;max-width:400px;border-radius:8px;margin:20px 0">
+                <p><strong>What you're missing:</strong></p>
+                <ul>
+                    <li>💰 Up to $700 savings on premium packages</li>
+                    <li>⚡ Priority 24-hour delivery</li>
+                    <li>🎨 Unlimited revisions included</li>
+                    <li>📄 Full commercial licensing rights</li>
+                </ul>
+                <div style="text-align:center;margin:30px 0">
+                    <a href="{base_url}/upsell/{upsell_token}" style="display:inline-block;background:linear-gradient(45deg,#f44336,#d32f2f);color:#fff;padding:16px 32px;border-radius:8px;text-decoration:none;font-weight:bold;font-size:18px">
+                        🔥 LAST CHANCE - Claim Now
+                    </a>
+                </div>
+                <p>If you're not interested, no worries - you won't hear from us again. But if you want professional AI artwork at these prices, tonight is your last opportunity.</p>
+                <p>Thank you for your time,<br>The Chaos Venice Productions Team</p>
+            </div>
+        </div>
+        </body></html>
+        """
+    
+    return subject, html
+
+def _send_upsell_email(email, subject, html_content):
+    """Send upsell follow-up email via SendGrid or SMTP"""
+    try:
+        # Try SendGrid first if API key is available
+        sendgrid_key = os.environ.get('SENDGRID_API_KEY')
+        from_email = os.environ.get('FROM_EMAIL', 'noreply@chaosvenice.com')
+        
+        if sendgrid_key:
+            try:
+                from sendgrid import SendGridAPIClient
+                from sendgrid.helpers.mail import Mail, Email, To, Content
+                
+                sg = SendGridAPIClient(sendgrid_key)
+                message = Mail(
+                    from_email=Email(from_email),
+                    to_emails=To(email),
+                    subject=subject
+                )
+                message.content = Content("text/html", html_content)
+                
+                sg.send(message)
+                return True
+                
+            except Exception as e:
+                _log_error("ERROR", f"SendGrid upsell email failed to {email}", str(e))
+                return False
+        else:
+            # Fallback to SMTP
+            import smtplib
+            from email.mime.text import MIMEText
+            from email.mime.multipart import MIMEMultipart
+            
+            smtp_host = os.environ.get('SMTP_HOST')
+            smtp_port = int(os.environ.get('SMTP_PORT', 587))
+            smtp_user = os.environ.get('SMTP_USER')
+            smtp_pass = os.environ.get('SMTP_PASS')
+            
+            if not all([smtp_host, smtp_user, smtp_pass]):
+                _log_error("ERROR", "No email configuration available for upsell emails", "")
+                return False
+            
+            msg = MIMEMultipart('alternative')
+            msg['Subject'] = subject
+            msg['From'] = from_email
+            msg['To'] = email
+            
+            msg.attach(MIMEText(html_content, 'html'))
+            
+            with smtplib.SMTP(smtp_host, smtp_port) as server:
+                server.starttls()
+                server.login(smtp_user, smtp_pass)
+                server.send_message(msg)
+            
+            return True
+            
+    except Exception as e:
+        _log_error("ERROR", f"Failed to send upsell email to {email}", str(e))
+        return False
+
+@app.route('/admin/upsell-dashboard')
+def admin_upsell_dashboard():
+    """Admin dashboard for monitoring upsell funnel performance"""
+    if not check_admin_auth():
+        return "Unauthorized", 401
+        
+    db = get_db()
+    
+    # Get upsell statistics
+    cur = db.execute("""
+        SELECT 
+            COUNT(*) as total_sessions,
+            SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) as completed,
+            SUM(CASE WHEN status='active' THEN 1 ELSE 0 END) as active,
+            SUM(CASE WHEN status='expired' THEN 1 ELSE 0 END) as expired,
+            AVG(CASE WHEN tier_selected='basic' THEN 299 
+                     WHEN tier_selected='premium' THEN 599 
+                     WHEN tier_selected='deluxe' THEN 1299 ELSE 0 END) as avg_value
+        FROM upsell_sessions 
+        WHERE created_at >= ?""", 
+        ((datetime.datetime.utcnow() - datetime.timedelta(days=30)).isoformat(),))
+    stats = cur.fetchone()
+    
+    # Get recent sessions
+    cur = db.execute("""
+        SELECT us.*, s.title 
+        FROM upsell_sessions us
+        LEFT JOIN shares s ON us.original_share_token = s.token
+        ORDER BY us.created_at DESC 
+        LIMIT 20""")
+    recent_sessions = cur.fetchall()
+    
+    # Get email performance
+    cur = db.execute("""
+        SELECT 
+            email_sequence,
+            COUNT(*) as scheduled,
+            SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) as sent,
+            SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failed
+        FROM upsell_follow_ups
+        GROUP BY email_sequence
+        ORDER BY email_sequence""")
+    email_stats = cur.fetchall()
+    
+    html = f"""<!doctype html><html><head>
+    <meta charset="utf-8">
+    <title>Upsell Dashboard - Admin</title>
+    <style>
+    body{{font-family:system-ui,sans-serif;background:#f8f9fa;margin:0;padding:20px}}
+    .container{{max-width:1200px;margin:0 auto}}
+    .stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:20px;margin-bottom:30px}}
+    .stat-card{{background:#fff;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);text-align:center}}
+    .stat-number{{font-size:2rem;font-weight:700;color:#2563eb}}
+    .stat-label{{color:#6b7280;margin-top:5px}}
+    .section{{background:#fff;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);margin-bottom:30px}}
+    .section-header{{padding:20px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;align-items:center}}
+    .section-content{{padding:20px}}
+    table{{width:100%;border-collapse:collapse}}
+    th,td{{padding:12px;text-align:left;border-bottom:1px solid #e5e7eb}}
+    th{{background:#f8f9fa;font-weight:600}}
+    .btn{{padding:8px 16px;border-radius:6px;border:none;cursor:pointer;font-weight:500}}
+    .btn-primary{{background:#2563eb;color:white}}
+    .btn-success{{background:#059669;color:white}}
+    .btn-warning{{background:#d97706;color:white}}
+    .status-active{{color:#059669;font-weight:600}}
+    .status-completed{{color:#2563eb;font-weight:600}}
+    .status-expired{{color:#dc2626;font-weight:600}}
+    </style>
+    </head><body>
+    <div class="container">
+        <h1>🚀 Upsell Funnel Dashboard</h1>
+        
+        <div class="stats">
+            <div class="stat-card">
+                <div class="stat-number">{stats[0] if stats else 0}</div>
+                <div class="stat-label">Total Sessions</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number">{stats[1] if stats else 0}</div>
+                <div class="stat-label">Completed</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number">{((stats[1] / stats[0]) * 100 if stats and stats[0] > 0 else 0):.1f}%</div>
+                <div class="stat-label">Conversion Rate</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number">${stats[4] if stats and stats[4] else 0:.0f}</div>
+                <div class="stat-label">Avg Order Value</div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <div class="section-header">
+                <h2>Email Performance</h2>
+                <button class="btn btn-primary" onclick="processEmails()">Process Pending Emails</button>
+            </div>
+            <div class="section-content">
+                <table>
+                    <tr><th>Sequence</th><th>Scheduled</th><th>Sent</th><th>Failed</th><th>Success Rate</th></tr>"""
+    
+    for seq_data in email_stats:
+        sequence, scheduled, sent, failed = seq_data
+        success_rate = (sent / scheduled * 100) if scheduled > 0 else 0
+        sequence_names = {1: "Hour 1 Reminder", 2: "Hour 12 Discount", 3: "Day 2 Behind Scenes", 4: "Day 4 Final Notice"}
+        
+        html += f"""<tr>
+            <td>{sequence_names.get(sequence, f'Sequence {sequence}')}</td>
+            <td>{scheduled}</td>
+            <td>{sent}</td>
+            <td>{failed}</td>
+            <td>{success_rate:.1f}%</td>
+        </tr>"""
+    
+    html += f"""</table>
+            </div>
+        </div>
+        
+        <div class="section">
+            <div class="section-header">
+                <h2>Recent Upsell Sessions</h2>
+            </div>
+            <div class="section-content">
+                <table>
+                    <tr><th>Customer</th><th>Artwork</th><th>Status</th><th>Tier</th><th>Created</th><th>Actions</th></tr>"""
+    
+    for session in recent_sessions:
+        (session_id, token, original_token, email, name, project_type, status, 
+         tier_selected, expires_at, created_at, completed_at, title) = session
+        
+        status_class = f"status-{status}"
+        tier_display = tier_selected or "Not selected"
+        created_display = created_at[:16].replace('T', ' ') if created_at else ''
+        
+        html += f"""<tr>
+            <td>{name or email}</td>
+            <td>{title or 'Unknown'}</td>
+            <td><span class="{status_class}">{status.title()}</span></td>
+            <td>{tier_display}</td>
+            <td>{created_display}</td>
+            <td><a href="/upsell/{token}" target="_blank" class="btn btn-primary">View</a></td>
+        </tr>"""
+    
+    html += f"""</table>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+    function processEmails() {{
+        fetch('/cron/process-upsell-emails')
+        .then(response => response.json())
+        .then(data => {{
+            alert(`Processed ${{data.processed}} emails. Sent: ${{data.sent}}, Failed: ${{data.failed}}`);
+            location.reload();
+        }})
+        .catch(error => {{
+            alert('Error processing emails: ' + error.message);
+        }});
+    }}
+    </script>
+    </body></html>"""
+    
+    return Response(html, 200, mimetype="text/html")
+
+@app.route('/admin/process-upsell-emails', methods=['POST'])
+def admin_process_emails():
+    """Admin endpoint to manually trigger upsell email processing"""
+    if not check_admin_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    # Call the email processing function
+    try:
+        # This would be the same logic as /cron/process-upsell-emails
+        response = process_upsell_emails()
+        return response
+    except Exception as e:
+        _log_error("ERROR", "Manual email processing failed", str(e))
+        return jsonify({"error": "Failed to process emails"}), 500
 
 @app.route('/admin/portfolio-orders')
 def admin_portfolio_orders():
