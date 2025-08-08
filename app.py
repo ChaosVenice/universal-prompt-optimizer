@@ -410,53 +410,71 @@ def scheduled_process_email_retries():
         db = get_db()
         
         # Get failed emails that haven't exceeded retry limit (example: 3 retries max)
+        # Working with existing schema: id, lead_id, email_to, subject, trigger_type, status, retry_count, share_token, sent_at, error_message
         cur = db.execute("""SELECT * FROM sent_emails 
-                            WHERE status='failed' AND retry_count < 3 
-                            AND last_attempt < ?""",
-                         ((datetime.datetime.utcnow() - timedelta(hours=1)).isoformat(),))
+                            WHERE status='failed' AND retry_count < 3""")
         
         failed_emails = cur.fetchall()
         
         for email_record in failed_emails:
             try:
-                email_id, lead_id, email_type, status, retry_count, last_attempt, share_token, sent_at, error_message = email_record
+                email_id, lead_id, email_to, subject, trigger_type, status, retry_count, share_token, sent_at, error_message = email_record
                 
-                # Get lead info
-                cur = db.execute("SELECT email, name FROM leads WHERE id=?", (lead_id,))
+                # Get lead info - leads table has: id, email, share_token, ip_address, created_at, source
+                cur = db.execute("SELECT email FROM leads WHERE id=?", (lead_id,))
                 lead_data = cur.fetchone()
                 
                 if lead_data:
-                    email_addr, name = lead_data
+                    email_addr = lead_data[0]
+                    name = "Valued Customer"  # Use generic name since leads table doesn't store names
                     
-                    # Retry the email based on type
-                    if email_type == 'download':
-                        success = _send_download_followup_email(email_addr, name, share_token)
-                    elif email_type == 'hire_us':
-                        success = _send_hire_us_followup_email(email_addr, name)
+                    # Retry the email based on trigger_type
+                    if trigger_type == 'download':
+                        # Send download follow-up email
+                        subject = "Thanks for exploring Chaos Venice Productions"
+                        html_content = f"""<!DOCTYPE html>
+                        <html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;">
+                        <h2>Hi {name}!</h2>
+                        <p>Thanks for your interest in our creative work. We'd love to help bring your vision to life!</p>
+                        <p>Ready for a custom commission? <a href="mailto:hello@chaosvenice.com?subject=Commission%20Inquiry" style="color:#0066cc;">Get in touch</a></p>
+                        <p>Best regards,<br>Chaos Venice Productions</p>
+                        </body></html>"""
+                        success = send_email(email_addr, subject, html_content)
+                    elif trigger_type == 'hire_us':
+                        # Send hire us follow-up email
+                        subject = "Your Creative Vision Awaits"
+                        html_content = f"""<!DOCTYPE html>
+                        <html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;">
+                        <h2>Hi {name}!</h2>
+                        <p>Thank you for reaching out to Chaos Venice Productions. We've received your inquiry and will respond within 24 hours.</p>
+                        <p>In the meantime, feel free to explore more of our work and let us know if you have any specific questions!</p>
+                        <p>Best regards,<br>Chaos Venice Productions</p>
+                        </body></html>"""
+                        success = send_email(email_addr, subject, html_content)
                     else:
                         continue
                     
                     # Update retry attempt
                     new_retry_count = retry_count + 1
                     if success:
-                        db.execute("""UPDATE sent_emails SET status='sent', retry_count=?, last_attempt=?
+                        db.execute("""UPDATE sent_emails SET status='sent', retry_count=?
                                      WHERE id=?""",
-                                  (new_retry_count, datetime.datetime.utcnow().isoformat(), email_id))
+                                  (new_retry_count, email_id))
                     else:
-                        db.execute("""UPDATE sent_emails SET retry_count=?, last_attempt=?
+                        db.execute("""UPDATE sent_emails SET retry_count=?
                                      WHERE id=?""",
-                                  (new_retry_count, datetime.datetime.utcnow().isoformat(), email_id))
+                                  (new_retry_count, email_id))
                         
             except Exception as e:
-                logger.error(f"Failed to retry email {email_record[0]}: {e}")
+                log.error(f"Failed to retry email {email_record[0]}: {e}")
         
         db.commit()
         
         if failed_emails:
-            logger.info(f"Retried {len(failed_emails)} failed emails")
+            log.info(f"Retried {len(failed_emails)} failed emails")
             
     except Exception as e:
-        logger.exception("scheduled_process_email_retries error: %s", e)
+        log.exception("scheduled_process_email_retries error: %s", e)
 
 def scheduled_cleanup_expired_sessions():
     """Scheduled job for cleaning up expired sessions and tokens"""

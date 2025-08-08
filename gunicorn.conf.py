@@ -1,6 +1,6 @@
 import os
 
-bind = f"0.0.0.0:{os.environ.get('PORT', '8000')}"
+bind = f"0.0.0.0:{os.environ.get('PORT', '5000')}"
 workers = 1            # IMPORTANT on Replit so the scheduler runs once
 worker_class = "gthread"
 threads = 16
