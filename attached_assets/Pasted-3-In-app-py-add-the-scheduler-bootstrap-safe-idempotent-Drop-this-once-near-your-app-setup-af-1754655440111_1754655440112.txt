@@ -1,0 +1,152 @@
+3) In app.py, add the scheduler bootstrap (safe + idempotent)
+Drop this once near your app setup (after app = Flask(__name__) and DB init). If you already have a scheduler, replace it with this block.
+
+python
+Copy
+Edit
+import os, atexit, logging
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from datetime import timedelta
+
+logger = logging.getLogger(__name__)
+_scheduler = None
+
+def _start_background_scheduler():
+    global _scheduler
+    # Avoid double-starts (reloader / hot runs)
+    if _scheduler is not None:
+        return _scheduler
+    _scheduler = BackgroundScheduler(timezone="UTC", daemon=True)
+
+    # === JOBS ===
+    # 1) Process upsell email steps (hourly)
+    _scheduler.add_job(
+        func=process_upsell_emails,  # you already created this; if not, add stub below
+        trigger=IntervalTrigger(minutes=15),
+        id="process_upsell_emails",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
+    )
+
+    # 2) Retry failed transactional emails (with exponential/backoff already in code)
+    _scheduler.add_job(
+        func=process_email_retries,  # add stub below if missing
+        trigger=IntervalTrigger(minutes=10),
+        id="process_email_retries",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
+    )
+
+    # 3) Cleanup expired sessions / stale tokens
+    _scheduler.add_job(
+        func=cleanup_expired_sessions,  # add stub below if missing
+        trigger=IntervalTrigger(hours=1),
+        id="cleanup_expired_sessions",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=120,
+    )
+
+    _scheduler.start()
+    atexit.register(lambda: _scheduler.shutdown(wait=False))
+    logger.info("BackgroundScheduler started with 3 jobs.")
+    return _scheduler
+
+# Call during app startup
+_start_background_scheduler()
+If any of those functions don’t exist yet, add simple, safe stubs now so the app boots (you can replace with your real implementations if you already wrote them):
+
+python
+Copy
+Edit
+def process_upsell_emails():
+    try:
+        # pull pending upsell steps from DB and send
+        # mark sent/failed with timestamps + statuses
+        # (your existing logic likely lives under /admin/upsell/process or similar)
+        # call the same internal function you exposed in the admin endpoint
+        _internal_process_upsell_emails()  # rename to your real function
+    except Exception as e:
+        app.logger.exception("process_upsell_emails error: %s", e)
+
+def process_email_retries():
+    try:
+        # scan email_outbox/email_logs where status IN ('failed','pending_retry')
+        # and retry_count < limit; requeue/send using SendGrid
+        _internal_process_email_retries()  # rename to your real function
+    except Exception as e:
+        app.logger.exception("process_email_retries error: %s", e)
+
+def cleanup_expired_sessions():
+    try:
+        # delete/expire upsell sessions past deadline, old share tokens, stale oauth states, etc.
+        _internal_cleanup_expired_sessions()  # rename to your real function
+    except Exception as e:
+        app.logger.exception("cleanup_expired_sessions error: %s", e)
+If you already have these helpers, just call them directly. The stubs are only to keep boot green.
+
+4) Health + Scheduler status (quick sanity route)
+Add this tiny admin-ish route so you can confirm the scheduler is alive from the browser:
+
+python
+Copy
+Edit
+from flask import jsonify
+import datetime as dt
+
+@app.get("/admin/system")
+def admin_system():
+    jobs = []
+    try:
+        if _scheduler:
+            for j in _scheduler.get_jobs():
+                jobs.append({
+                    "id": j.id,
+                    "next_run_time": j.next_run_time.isoformat() if j.next_run_time else None
+                })
+    except Exception as e:
+        jobs = [{"error": str(e)}]
+
+    return jsonify({
+        "ok": True,
+        "utc_time": dt.datetime.utcnow().isoformat(),
+        "scheduler_jobs": jobs
+    }), 200
+You should see 3 jobs listed with upcoming run times.
+
+5) Replit .replit (unchanged, just confirming)
+ini
+Copy
+Edit
+run = "pip install -r requirements.txt && gunicorn -c gunicorn.conf.py app:app"
+language = "python"
+entrypoint = "app.py"
+6) Secrets checklist (Replit → Tools → Secrets)
+SENDGRID_API_KEY
+
+FROM_EMAIL=hello@chaosvenice.com
+
+Any DB path / OAuth keys you use
+
+7) How to verify (2 minutes)
+Click Run in Replit.
+
+Open /admin/system → confirm 3 scheduler jobs + next run times.
+
+Trigger a test case:
+
+Create a dummy upsell session or a failed email in DB (or use your admin to queue one).
+
+Wait for 10–15 minutes, or manually hit your admin “process” endpoint once to seed status.
+
+Check logs: you should see “BackgroundScheduler started…” and job runs every 10–15 minutes.
+
+Confirm the DB shows updates (email status moved to sent, retries incremented, expired sessions cleared).
+
+Why this maximizes reliability on Replit

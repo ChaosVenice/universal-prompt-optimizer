@@ -4898,6 +4898,12 @@ def _send_upsell_email(email, subject, html_content):
         _log_error("ERROR", f"Failed to send upsell email to {email}", str(e))
         return False
 
+def check_admin_auth():
+    """Check if admin authentication is valid"""
+    admin_token = request.args.get('admin_token') or request.headers.get('Authorization')
+    required_token = os.environ.get('ADMIN_TOKEN', 'admin123')
+    return admin_token == required_token
+
 @app.route('/admin/upsell-dashboard')
 def admin_upsell_dashboard():
     """Admin dashboard for monitoring upsell funnel performance"""
