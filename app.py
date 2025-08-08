@@ -27,6 +27,22 @@ from datetime import timedelta
 app = Flask(__name__)
 app.secret_key = os.environ.get("SESSION_SECRET")
 
+# Performance optimizations
+app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False  # Faster JSON responses
+app.config['JSON_SORT_KEYS'] = False  # Preserve JSON key order for better caching
+
+# Memory-based response cache for frequently accessed data
+from functools import lru_cache
+import hashlib
+
+# Create a simple cache decorator for expensive operations
+def cache_response(maxsize=128):
+    """Cache decorator for expensive operations"""
+    def decorator(func):
+        cached_func = lru_cache(maxsize=maxsize)(func)
+        return cached_func
+    return decorator
+
 logger = logging.getLogger(__name__)
 _scheduler = None
 
@@ -73,9 +89,10 @@ def send_email(to_email: str, subject: str, text: str):
             msg["To"] = to_email
             msg["Date"] = formatdate(localtime=True)
 
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            # Type-safe SMTP connection
+            with smtplib.SMTP(str(SMTP_HOST), SMTP_PORT) as server:
                 server.starttls()
-                server.login(SMTP_USER, SMTP_PASS)
+                server.login(str(SMTP_USER), str(SMTP_PASS))
                 server.sendmail(FROM_EMAIL, [to_email], msg.as_string())
             print(f"[email] Sent via SMTP to {to_email}")
             return True
@@ -91,7 +108,15 @@ DB_PATH = os.getenv("USAGE_DB", "usage.db")
 
 def get_db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
+        # Optimized database connection with performance settings
+        g.db = sqlite3.connect(DB_PATH, timeout=30.0, check_same_thread=False)
+        g.db.row_factory = sqlite3.Row  # Enable dictionary-like access
+        # Performance optimizations
+        g.db.execute("PRAGMA journal_mode=WAL")
+        g.db.execute("PRAGMA synchronous=NORMAL")
+        g.db.execute("PRAGMA cache_size=10000")
+        g.db.execute("PRAGMA temp_store=MEMORY")
+        
         g.db.execute("""CREATE TABLE IF NOT EXISTS usage (
             key TEXT NOT NULL,
             day TEXT NOT NULL,
@@ -108,6 +133,21 @@ def get_db():
             notes TEXT,
             created_at TEXT NOT NULL  -- ISO datetime
         )""")
+        
+        # Create comprehensive indexes for optimal query performance
+        g.db.execute("CREATE INDEX IF NOT EXISTS idx_usage_key_day ON usage(key, day)")
+        g.db.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_status ON api_keys(status)")
+        g.db.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_expires ON api_keys(expires_at)")
+        g.db.execute("CREATE INDEX IF NOT EXISTS idx_shares_token ON shares(token)")
+        g.db.execute("CREATE INDEX IF NOT EXISTS idx_shares_expires ON shares(expires_at)")
+        g.db.execute("CREATE INDEX IF NOT EXISTS idx_leads_email ON leads(email)")
+        g.db.execute("CREATE INDEX IF NOT EXISTS idx_leads_share_token ON leads(share_token)")
+        g.db.execute("CREATE INDEX IF NOT EXISTS idx_sent_emails_status ON sent_emails(status)")
+        g.db.execute("CREATE INDEX IF NOT EXISTS idx_upsell_sessions_token ON upsell_sessions(upsell_token)")
+        g.db.execute("CREATE INDEX IF NOT EXISTS idx_upsell_sessions_expires ON upsell_sessions(expires_at)")
+        g.db.execute("CREATE INDEX IF NOT EXISTS idx_upsell_followups_status ON upsell_follow_ups(status)")
+        g.db.execute("CREATE INDEX IF NOT EXISTS idx_upsell_followups_scheduled ON upsell_follow_ups(scheduled_at)")
+        
     return g.db
 
 @app.teardown_appcontext
@@ -343,7 +383,9 @@ def _start_background_scheduler():
     )
 
     _scheduler.start()
-    atexit.register(lambda: _scheduler.shutdown(wait=False))
+    # Type-safe scheduler shutdown registration
+    if _scheduler is not None:
+        atexit.register(lambda: _scheduler.shutdown(wait=False) if _scheduler else None)
     log.info("BackgroundScheduler started with jobs: %s", [j.id for j in _scheduler.get_jobs()])
     return _scheduler
 
@@ -1261,9 +1303,10 @@ def _send_automated_email(lead_id, email_to, trigger_type, share_token=None, gen
     
     elif trigger_type == 'manual':
         # Manual emails would have custom content passed in generation_data
-        subject = generation_data.get('subject', 'Message from Chaos Venice Productions')
-        html_content = generation_data.get('html_content', '<p>Custom message content</p>')
-        text_content = generation_data.get('text_content', 'Custom message content')
+        manual_data = generation_data or {}
+        subject = manual_data.get('subject', 'Message from Chaos Venice Productions')
+        html_content = manual_data.get('html_content', '<p>Custom message content</p>')
+        text_content = manual_data.get('text_content', 'Custom message content')
     
     else:
         return False, f"Unknown trigger type: {trigger_type}"
@@ -4882,7 +4925,7 @@ def upsell_confirmation(upsell_token):
       <div class="success">
         <div class="logo">CHAOS VENICE PRODUCTIONS</div>
         <h1>🎉 Order Confirmed!</h1>
-        <p>Thank you for choosing the <strong>{tier.title()} Package (${price})</strong></p>
+        <p>Thank you for choosing the <strong>{tier.title() if tier else 'Selected'} Package (${price if price else 'TBD'})</strong></p>
         <p>You'll receive a detailed timeline and preview within 24 hours.</p>
       </div>
       
@@ -5108,28 +5151,52 @@ def _send_upsell_email(email, subject, html_content):
         sendgrid_key = os.environ.get('SENDGRID_API_KEY')
         from_email = os.environ.get('FROM_EMAIL', 'noreply@chaosvenice.com')
         
-        if sendgrid_key:
+        if sendgrid_key and from_email:
             try:
-                from sendgrid import SendGridAPIClient
-                from sendgrid.helpers.mail import Mail, Email, To, Content
-                
-                sg = SendGridAPIClient(sendgrid_key)
-                message = Mail(
-                    from_email=Email(from_email),
-                    to_emails=To(email),
-                    subject=subject
-                )
-                message.content = Content("text/html", html_content)
-                
-                sg.send(message)
+                # Optimized SendGrid implementation
+                import urllib.request, urllib.error
+                url = "https://api.sendgrid.com/v3/mail/send"
+                body = {
+                    "personalizations": [{"to": [{"email": email}], "subject": subject}],
+                    "from": {"email": from_email},
+                    "content": [{"type": "text/html", "value": html_content}],
+                }
+                req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), method="POST")
+                req.add_header("Authorization", f"Bearer {sendgrid_key}")
+                req.add_header("Content-Type", "application/json")
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    _ = resp.read()
                 return True
                 
             except Exception as e:
                 _log_error("ERROR", f"SendGrid upsell email failed to {email}", str(e))
                 return False
         else:
-            # Fallback to SMTP
-            import smtplib
+            # Fallback to SMTP with type safety
+            smtp_host = os.environ.get('SMTP_HOST')
+            smtp_user = os.environ.get('SMTP_USER') 
+            smtp_pass = os.environ.get('SMTP_PASS')
+            
+            if smtp_host and smtp_user and smtp_pass and from_email:
+                try:
+                    import smtplib
+                    from email.mime.text import MIMEText
+                    from email.utils import formatdate
+                    
+                    msg = MIMEText(html_content, "html", "utf-8")
+                    msg["Subject"] = subject
+                    msg["From"] = from_email
+                    msg["To"] = email
+                    msg["Date"] = formatdate(localtime=True)
+
+                    with smtplib.SMTP(str(smtp_host), int(os.environ.get('SMTP_PORT', '587'))) as server:
+                        server.starttls()
+                        server.login(str(smtp_user), str(smtp_pass))
+                        server.sendmail(from_email, [email], msg.as_string())
+                    return True
+                except Exception as e:
+                    _log_error("ERROR", f"SMTP upsell email failed to {email}", str(e))
+                    return False
             from email.mime.text import MIMEText
             from email.mime.multipart import MIMEMultipart
             
