@@ -18,9 +18,17 @@ from email.mime.text import MIMEText
 from email.utils import formatdate
 from functools import wraps
 from flask import Flask, request, jsonify, Response, g, abort
+import atexit
+import logging
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from datetime import timedelta
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SESSION_SECRET")
+
+logger = logging.getLogger(__name__)
+_scheduler = None
 
 # --- EMAIL UTILS ---
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
@@ -257,6 +265,206 @@ def _init_share_table():
         )""")
         
         db.commit()
+
+# --- SCHEDULER SETUP ---
+
+def _start_background_scheduler():
+    global _scheduler
+    # Avoid double-starts (reloader / hot runs)
+    if _scheduler is not None:
+        return _scheduler
+    _scheduler = BackgroundScheduler(timezone="UTC", daemon=True)
+
+    # === JOBS ===
+    # 1) Process upsell email steps (every 15 minutes)
+    _scheduler.add_job(
+        func=scheduled_process_upsell_emails,
+        trigger=IntervalTrigger(minutes=15),
+        id="process_upsell_emails",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
+    )
+
+    # 2) Retry failed transactional emails (every 10 minutes)
+    _scheduler.add_job(
+        func=scheduled_process_email_retries,
+        trigger=IntervalTrigger(minutes=10),
+        id="process_email_retries",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
+    )
+
+    # 3) Cleanup expired sessions / stale tokens (every hour)
+    _scheduler.add_job(
+        func=scheduled_cleanup_expired_sessions,
+        trigger=IntervalTrigger(hours=1),
+        id="cleanup_expired_sessions",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=120,
+    )
+
+    _scheduler.start()
+    atexit.register(lambda: _scheduler.shutdown(wait=False))
+    logger.info("BackgroundScheduler started with 3 jobs.")
+    return _scheduler
+
+def scheduled_process_upsell_emails():
+    """Scheduled job wrapper for upsell email processing"""
+    try:
+        # Call the existing endpoint logic
+        db = get_db()
+        
+        # Get all scheduled follow-ups that need to be sent
+        cur = db.execute("""SELECT uf.*, us.customer_name, us.customer_email, us.original_share_token, s.title, s.meta_json
+                            FROM upsell_follow_ups uf
+                            JOIN upsell_sessions us ON uf.upsell_token = us.upsell_token
+                            LEFT JOIN shares s ON us.original_share_token = s.token
+                            WHERE uf.status='scheduled' AND uf.scheduled_at <= ?
+                            ORDER BY uf.scheduled_at ASC""",
+                         (datetime.datetime.utcnow().isoformat(),))
+        
+        pending_emails = cur.fetchall()
+        sent_count = 0
+        
+        for email_data in pending_emails:
+            (follow_up_id, upsell_token, sequence, scheduled_at, sent_at, status,
+             name, email, original_token, title, meta_json) = email_data
+            
+            try:
+                # Get image for email
+                meta = json.loads(meta_json or '{}')
+                image_url = meta.get('images', [''])[0] or ''
+                
+                # Generate email content based on sequence
+                subject, html_content = _generate_upsell_email_content(sequence, name, title, image_url, upsell_token)
+                
+                # Send email using SendGrid or SMTP
+                success = _send_upsell_email(email, subject, html_content)
+                
+                if success:
+                    # Mark as sent
+                    db.execute("""UPDATE upsell_follow_ups SET status='sent', sent_at=?
+                                 WHERE id=?""",
+                              (datetime.datetime.utcnow().isoformat(), follow_up_id))
+                    sent_count += 1
+                else:
+                    # Mark as failed
+                    db.execute("""UPDATE upsell_follow_ups SET status='failed'
+                                 WHERE id=?""", (follow_up_id,))
+                    
+            except Exception as e:
+                _log_error("ERROR", f"Failed to send upsell email {follow_up_id}", str(e))
+                db.execute("""UPDATE upsell_follow_ups SET status='failed'
+                             WHERE id=?""", (follow_up_id,))
+        
+        db.commit()
+        
+        if pending_emails:
+            logger.info(f"Processed {len(pending_emails)} upsell emails, {sent_count} sent successfully")
+            
+    except Exception as e:
+        logger.exception("scheduled_process_upsell_emails error: %s", e)
+
+def scheduled_process_email_retries():
+    """Scheduled job for retrying failed emails"""
+    try:
+        db = get_db()
+        
+        # Get failed emails that haven't exceeded retry limit (example: 3 retries max)
+        cur = db.execute("""SELECT * FROM sent_emails 
+                            WHERE status='failed' AND retry_count < 3 
+                            AND last_attempt < ?""",
+                         ((datetime.datetime.utcnow() - timedelta(hours=1)).isoformat(),))
+        
+        failed_emails = cur.fetchall()
+        
+        for email_record in failed_emails:
+            try:
+                email_id, lead_id, email_type, status, retry_count, last_attempt, share_token, sent_at, error_message = email_record
+                
+                # Get lead info
+                cur = db.execute("SELECT email, name FROM leads WHERE id=?", (lead_id,))
+                lead_data = cur.fetchone()
+                
+                if lead_data:
+                    email_addr, name = lead_data
+                    
+                    # Retry the email based on type
+                    if email_type == 'download':
+                        success = _send_download_followup_email(email_addr, name, share_token)
+                    elif email_type == 'hire_us':
+                        success = _send_hire_us_followup_email(email_addr, name)
+                    else:
+                        continue
+                    
+                    # Update retry attempt
+                    new_retry_count = retry_count + 1
+                    if success:
+                        db.execute("""UPDATE sent_emails SET status='sent', retry_count=?, last_attempt=?
+                                     WHERE id=?""",
+                                  (new_retry_count, datetime.datetime.utcnow().isoformat(), email_id))
+                    else:
+                        db.execute("""UPDATE sent_emails SET retry_count=?, last_attempt=?
+                                     WHERE id=?""",
+                                  (new_retry_count, datetime.datetime.utcnow().isoformat(), email_id))
+                        
+            except Exception as e:
+                logger.error(f"Failed to retry email {email_record[0]}: {e}")
+        
+        db.commit()
+        
+        if failed_emails:
+            logger.info(f"Retried {len(failed_emails)} failed emails")
+            
+    except Exception as e:
+        logger.exception("scheduled_process_email_retries error: %s", e)
+
+def scheduled_cleanup_expired_sessions():
+    """Scheduled job for cleaning up expired sessions and tokens"""
+    try:
+        db = get_db()
+        
+        current_time = datetime.datetime.utcnow().isoformat()
+        
+        # Cleanup expired upsell sessions
+        cur = db.execute("SELECT COUNT(*) FROM upsell_sessions WHERE expires_at < ? AND status != 'expired'", (current_time,))
+        expired_count = cur.fetchone()[0]
+        
+        if expired_count > 0:
+            db.execute("UPDATE upsell_sessions SET status='expired' WHERE expires_at < ? AND status != 'expired'", (current_time,))
+        
+        # Cleanup expired share tokens (older than 30 days)
+        thirty_days_ago = (datetime.datetime.utcnow() - timedelta(days=30)).isoformat()
+        cur = db.execute("SELECT COUNT(*) FROM shares WHERE expires_at < ?", (thirty_days_ago,))
+        old_shares_count = cur.fetchone()[0]
+        
+        if old_shares_count > 0:
+            db.execute("DELETE FROM shares WHERE expires_at < ?", (thirty_days_ago,))
+            
+        # Cleanup old logs (older than 90 days)
+        ninety_days_ago = (datetime.datetime.utcnow() - timedelta(days=90)).isoformat()
+        cur = db.execute("SELECT COUNT(*) FROM error_logs WHERE created_at < ?", (ninety_days_ago,))
+        old_logs_count = cur.fetchone()[0]
+        
+        if old_logs_count > 0:
+            db.execute("DELETE FROM error_logs WHERE created_at < ?", (ninety_days_ago,))
+        
+        db.commit()
+        
+        if expired_count > 0 or old_shares_count > 0 or old_logs_count > 0:
+            logger.info(f"Cleanup: {expired_count} expired upsell sessions, {old_shares_count} old shares, {old_logs_count} old logs")
+            
+    except Exception as e:
+        logger.exception("scheduled_cleanup_expired_sessions error: %s", e)
+
+# Start the scheduler
+_start_background_scheduler()
 
 # --- PORTFOLIO ENGINE FUNCTIONS ---
 
@@ -5082,6 +5290,29 @@ def admin_process_emails():
     except Exception as e:
         _log_error("ERROR", "Manual email processing failed", str(e))
         return jsonify({"error": "Failed to process emails"}), 500
+
+@app.route('/admin/system')
+def admin_system():
+    """Health check and scheduler status endpoint"""
+    jobs = []
+    try:
+        if _scheduler:
+            for j in _scheduler.get_jobs():
+                jobs.append({
+                    "id": j.id,
+                    "next_run_time": j.next_run_time.isoformat() if j.next_run_time else None,
+                    "func": j.func.__name__ if j.func else None
+                })
+    except Exception as e:
+        jobs = [{"error": str(e)}]
+
+    return jsonify({
+        "ok": True,
+        "utc_time": datetime.datetime.utcnow().isoformat(),
+        "scheduler_running": _scheduler is not None and _scheduler.running,
+        "scheduler_jobs": jobs,
+        "total_jobs": len(jobs)
+    }), 200
 
 @app.route('/admin/portfolio-orders')
 def admin_portfolio_orders():

@@ -120,6 +120,7 @@ The service provides comprehensive endpoints for prompt optimization and image g
 - **Revenue Integration**: Direct monetization through similar artwork orders and multi-tier licensing (Personal $49, Commercial $199, Exclusive $999)
 - **Automated Upsell Follow-Up Sequence**: Advanced revenue maximization system with tiered pricing offers ($299-$1299), 24-hour countdown timers, and 4-step email automation (Hour 1 reminder, Hour 12 discount, Day 2 behind-scenes, Day 4 final notice)
 - **Upsell Funnel Management**: Complete tracking system with database tables for upsell sessions, email campaigns, and conversion analytics with admin dashboard monitoring
+- **Background Scheduler**: APScheduler-based automated system for processing upsell emails (15min intervals), retrying failed emails (10min intervals), and cleanup operations (hourly) with graceful error handling and comprehensive logging
 
 # External Dependencies
 
