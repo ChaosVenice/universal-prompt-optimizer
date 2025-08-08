@@ -350,128 +350,130 @@ def _start_background_scheduler():
 def scheduled_process_upsell_emails():
     """Scheduled job wrapper for upsell email processing"""
     try:
-        # Call the existing endpoint logic
-        db = get_db()
-        
-        # Get all scheduled follow-ups that need to be sent
-        cur = db.execute("""SELECT uf.*, us.customer_name, us.customer_email, us.original_share_token, s.title, s.meta_json
-                            FROM upsell_follow_ups uf
-                            JOIN upsell_sessions us ON uf.upsell_token = us.upsell_token
-                            LEFT JOIN shares s ON us.original_share_token = s.token
-                            WHERE uf.status='scheduled' AND uf.scheduled_at <= ?
-                            ORDER BY uf.scheduled_at ASC""",
-                         (datetime.datetime.utcnow().isoformat(),))
-        
-        pending_emails = cur.fetchall()
-        sent_count = 0
-        
-        for email_data in pending_emails:
-            (follow_up_id, upsell_token, sequence, scheduled_at, sent_at, status,
-             name, email, original_token, title, meta_json) = email_data
+        with app.app_context():
+            # Call the existing endpoint logic
+            db = get_db()
             
-            try:
-                # Get image for email
-                meta = json.loads(meta_json or '{}')
-                image_url = meta.get('images', [''])[0] or ''
+            # Get all scheduled follow-ups that need to be sent
+            cur = db.execute("""SELECT uf.*, us.customer_name, us.customer_email, us.original_share_token, s.title, s.meta_json
+                                FROM upsell_follow_ups uf
+                                JOIN upsell_sessions us ON uf.upsell_token = us.upsell_token
+                                LEFT JOIN shares s ON us.original_share_token = s.token
+                                WHERE uf.status='scheduled' AND uf.scheduled_at <= ?
+                                ORDER BY uf.scheduled_at ASC""",
+                             (datetime.datetime.utcnow().isoformat(),))
+            
+            pending_emails = cur.fetchall()
+            sent_count = 0
+            
+            for email_data in pending_emails:
+                (follow_up_id, upsell_token, sequence, scheduled_at, sent_at, status,
+                 name, email, original_token, title, meta_json) = email_data
                 
-                # Generate email content based on sequence
-                subject, html_content = _generate_upsell_email_content(sequence, name, title, image_url, upsell_token)
-                
-                # Send email using SendGrid or SMTP
-                success = _send_upsell_email(email, subject, html_content)
-                
-                if success:
-                    # Mark as sent
-                    db.execute("""UPDATE upsell_follow_ups SET status='sent', sent_at=?
-                                 WHERE id=?""",
-                              (datetime.datetime.utcnow().isoformat(), follow_up_id))
-                    sent_count += 1
-                else:
-                    # Mark as failed
+                try:
+                    # Get image for email
+                    meta = json.loads(meta_json or '{}')
+                    image_url = meta.get('images', [''])[0] or ''
+                    
+                    # Generate email content based on sequence
+                    subject, html_content = _generate_upsell_email_content(sequence, name, title, image_url, upsell_token)
+                    
+                    # Send email using SendGrid or SMTP
+                    success = _send_upsell_email(email, subject, html_content)
+                    
+                    if success:
+                        # Mark as sent
+                        db.execute("""UPDATE upsell_follow_ups SET status='sent', sent_at=?
+                                     WHERE id=?""",
+                                  (datetime.datetime.utcnow().isoformat(), follow_up_id))
+                        sent_count += 1
+                    else:
+                        # Mark as failed
+                        db.execute("""UPDATE upsell_follow_ups SET status='failed'
+                                     WHERE id=?""", (follow_up_id,))
+                        
+                except Exception as e:
+                    _log_error("ERROR", f"Failed to send upsell email {follow_up_id}", str(e))
                     db.execute("""UPDATE upsell_follow_ups SET status='failed'
                                  WHERE id=?""", (follow_up_id,))
-                    
-            except Exception as e:
-                _log_error("ERROR", f"Failed to send upsell email {follow_up_id}", str(e))
-                db.execute("""UPDATE upsell_follow_ups SET status='failed'
-                             WHERE id=?""", (follow_up_id,))
-        
-        db.commit()
-        
-        if pending_emails:
-            logger.info(f"Processed {len(pending_emails)} upsell emails, {sent_count} sent successfully")
+            
+            db.commit()
+            
+            if pending_emails:
+                log.info(f"Processed {len(pending_emails)} upsell emails, {sent_count} sent successfully")
             
     except Exception as e:
-        logger.exception("scheduled_process_upsell_emails error: %s", e)
+        log.exception("scheduled_process_upsell_emails error: %s", e)
 
 def scheduled_process_email_retries():
     """Scheduled job for retrying failed emails"""
     try:
-        db = get_db()
-        
-        # Get failed emails that haven't exceeded retry limit (example: 3 retries max)
-        # Working with existing schema: id, lead_id, email_to, subject, trigger_type, status, retry_count, share_token, sent_at, error_message
-        cur = db.execute("""SELECT * FROM sent_emails 
-                            WHERE status='failed' AND retry_count < 3""")
-        
-        failed_emails = cur.fetchall()
-        
-        for email_record in failed_emails:
-            try:
-                email_id, lead_id, email_to, subject, trigger_type, status, retry_count, share_token, sent_at, error_message = email_record
-                
-                # Get lead info - leads table has: id, email, share_token, ip_address, created_at, source
-                cur = db.execute("SELECT email FROM leads WHERE id=?", (lead_id,))
-                lead_data = cur.fetchone()
-                
-                if lead_data:
-                    email_addr = lead_data[0]
-                    name = "Valued Customer"  # Use generic name since leads table doesn't store names
+        with app.app_context():
+            db = get_db()
+            
+            # Get failed emails that haven't exceeded retry limit (example: 3 retries max)
+            # Working with existing schema: id, lead_id, email_to, subject, trigger_type, status, retry_count, share_token, sent_at, error_message
+            cur = db.execute("""SELECT * FROM sent_emails 
+                                WHERE status='failed' AND retry_count < 3""")
+            
+            failed_emails = cur.fetchall()
+            
+            for email_record in failed_emails:
+                try:
+                    email_id, lead_id, email_to, subject, trigger_type, status, retry_count, share_token, sent_at, error_message = email_record
                     
-                    # Retry the email based on trigger_type
-                    if trigger_type == 'download':
-                        # Send download follow-up email
-                        subject = "Thanks for exploring Chaos Venice Productions"
-                        html_content = f"""<!DOCTYPE html>
-                        <html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;">
-                        <h2>Hi {name}!</h2>
-                        <p>Thanks for your interest in our creative work. We'd love to help bring your vision to life!</p>
-                        <p>Ready for a custom commission? <a href="mailto:hello@chaosvenice.com?subject=Commission%20Inquiry" style="color:#0066cc;">Get in touch</a></p>
-                        <p>Best regards,<br>Chaos Venice Productions</p>
-                        </body></html>"""
-                        success = send_email(email_addr, subject, html_content)
-                    elif trigger_type == 'hire_us':
-                        # Send hire us follow-up email
-                        subject = "Your Creative Vision Awaits"
-                        html_content = f"""<!DOCTYPE html>
-                        <html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;">
-                        <h2>Hi {name}!</h2>
-                        <p>Thank you for reaching out to Chaos Venice Productions. We've received your inquiry and will respond within 24 hours.</p>
-                        <p>In the meantime, feel free to explore more of our work and let us know if you have any specific questions!</p>
-                        <p>Best regards,<br>Chaos Venice Productions</p>
-                        </body></html>"""
-                        success = send_email(email_addr, subject, html_content)
-                    else:
-                        continue
+                    # Get lead info - leads table has: id, email, share_token, ip_address, created_at, source
+                    cur = db.execute("SELECT email FROM leads WHERE id=?", (lead_id,))
+                    lead_data = cur.fetchone()
                     
-                    # Update retry attempt
-                    new_retry_count = retry_count + 1
-                    if success:
-                        db.execute("""UPDATE sent_emails SET status='sent', retry_count=?
-                                     WHERE id=?""",
-                                  (new_retry_count, email_id))
-                    else:
-                        db.execute("""UPDATE sent_emails SET retry_count=?
-                                     WHERE id=?""",
-                                  (new_retry_count, email_id))
+                    if lead_data:
+                        email_addr = lead_data[0]
+                        name = "Valued Customer"  # Use generic name since leads table doesn't store names
                         
-            except Exception as e:
-                log.error(f"Failed to retry email {email_record[0]}: {e}")
-        
-        db.commit()
-        
-        if failed_emails:
-            log.info(f"Retried {len(failed_emails)} failed emails")
+                        # Retry the email based on trigger_type
+                        if trigger_type == 'download':
+                            # Send download follow-up email
+                            subject = "Thanks for exploring Chaos Venice Productions"
+                            html_content = f"""<!DOCTYPE html>
+                            <html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;">
+                            <h2>Hi {name}!</h2>
+                            <p>Thanks for your interest in our creative work. We'd love to help bring your vision to life!</p>
+                            <p>Ready for a custom commission? <a href="mailto:hello@chaosvenice.com?subject=Commission%20Inquiry" style="color:#0066cc;">Get in touch</a></p>
+                            <p>Best regards,<br>Chaos Venice Productions</p>
+                            </body></html>"""
+                            success = send_email(email_addr, subject, html_content)
+                        elif trigger_type == 'hire_us':
+                            # Send hire us follow-up email
+                            subject = "Your Creative Vision Awaits"
+                            html_content = f"""<!DOCTYPE html>
+                            <html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;">
+                            <h2>Hi {name}!</h2>
+                            <p>Thank you for reaching out to Chaos Venice Productions. We've received your inquiry and will respond within 24 hours.</p>
+                            <p>In the meantime, feel free to explore more of our work and let us know if you have any specific questions!</p>
+                            <p>Best regards,<br>Chaos Venice Productions</p>
+                            </body></html>"""
+                            success = send_email(email_addr, subject, html_content)
+                        else:
+                            continue
+                        
+                        # Update retry attempt
+                        new_retry_count = retry_count + 1
+                        if success:
+                            db.execute("""UPDATE sent_emails SET status='sent', retry_count=?
+                                         WHERE id=?""",
+                                      (new_retry_count, email_id))
+                        else:
+                            db.execute("""UPDATE sent_emails SET retry_count=?
+                                         WHERE id=?""",
+                                      (new_retry_count, email_id))
+                            
+                except Exception as e:
+                    log.error(f"Failed to retry email {email_record[0]}: {e}")
+            
+            db.commit()
+            
+            if failed_emails:
+                log.info(f"Retried {len(failed_emails)} failed emails")
             
     except Exception as e:
         log.exception("scheduled_process_email_retries error: %s", e)
@@ -479,40 +481,41 @@ def scheduled_process_email_retries():
 def scheduled_cleanup_expired_sessions():
     """Scheduled job for cleaning up expired sessions and tokens"""
     try:
-        db = get_db()
-        
-        current_time = datetime.datetime.utcnow().isoformat()
-        
-        # Cleanup expired upsell sessions
-        cur = db.execute("SELECT COUNT(*) FROM upsell_sessions WHERE expires_at < ? AND status != 'expired'", (current_time,))
-        expired_count = cur.fetchone()[0]
-        
-        if expired_count > 0:
-            db.execute("UPDATE upsell_sessions SET status='expired' WHERE expires_at < ? AND status != 'expired'", (current_time,))
-        
-        # Cleanup expired share tokens (older than 30 days)
-        thirty_days_ago = (datetime.datetime.utcnow() - timedelta(days=30)).isoformat()
-        cur = db.execute("SELECT COUNT(*) FROM shares WHERE expires_at < ?", (thirty_days_ago,))
-        old_shares_count = cur.fetchone()[0]
-        
-        if old_shares_count > 0:
-            db.execute("DELETE FROM shares WHERE expires_at < ?", (thirty_days_ago,))
+        with app.app_context():
+            db = get_db()
             
-        # Cleanup old logs (older than 90 days)
-        ninety_days_ago = (datetime.datetime.utcnow() - timedelta(days=90)).isoformat()
-        cur = db.execute("SELECT COUNT(*) FROM error_logs WHERE created_at < ?", (ninety_days_ago,))
-        old_logs_count = cur.fetchone()[0]
-        
-        if old_logs_count > 0:
-            db.execute("DELETE FROM error_logs WHERE created_at < ?", (ninety_days_ago,))
-        
-        db.commit()
-        
-        if expired_count > 0 or old_shares_count > 0 or old_logs_count > 0:
-            logger.info(f"Cleanup: {expired_count} expired upsell sessions, {old_shares_count} old shares, {old_logs_count} old logs")
+            current_time = datetime.datetime.utcnow().isoformat()
+            
+            # Cleanup expired upsell sessions
+            cur = db.execute("SELECT COUNT(*) FROM upsell_sessions WHERE expires_at < ? AND status != 'expired'", (current_time,))
+            expired_count = cur.fetchone()[0]
+            
+            if expired_count > 0:
+                db.execute("UPDATE upsell_sessions SET status='expired' WHERE expires_at < ? AND status != 'expired'", (current_time,))
+            
+            # Cleanup expired share tokens (older than 30 days)
+            thirty_days_ago = (datetime.datetime.utcnow() - timedelta(days=30)).isoformat()
+            cur = db.execute("SELECT COUNT(*) FROM shares WHERE expires_at < ?", (thirty_days_ago,))
+            old_shares_count = cur.fetchone()[0]
+            
+            if old_shares_count > 0:
+                db.execute("DELETE FROM shares WHERE expires_at < ?", (thirty_days_ago,))
+                
+            # Cleanup old logs (older than 90 days)
+            ninety_days_ago = (datetime.datetime.utcnow() - timedelta(days=90)).isoformat()
+            cur = db.execute("SELECT COUNT(*) FROM error_logs WHERE created_at < ?", (ninety_days_ago,))
+            old_logs_count = cur.fetchone()[0]
+            
+            if old_logs_count > 0:
+                db.execute("DELETE FROM error_logs WHERE created_at < ?", (ninety_days_ago,))
+            
+            db.commit()
+            
+            if expired_count > 0 or old_shares_count > 0 or old_logs_count > 0:
+                log.info(f"Cleanup: {expired_count} expired upsell sessions, {old_shares_count} old shares, {old_logs_count} old logs")
             
     except Exception as e:
-        logger.exception("scheduled_cleanup_expired_sessions error: %s", e)
+        log.exception("scheduled_cleanup_expired_sessions error: %s", e)
 
 # start it now (Gunicorn worker boot)
 _start_background_scheduler()
