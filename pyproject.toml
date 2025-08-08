@@ -10,4 +10,5 @@ dependencies = [
     "gunicorn>=23.0.0",
     "psycopg2-binary>=2.9.10",
     "requests>=2.32.4",
+    "sendgrid>=6.12.4",
 ]

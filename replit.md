@@ -1,6 +1,6 @@
 # Overview
 
-This is a Flask-based Universal Prompt Optimizer that transforms rough creative ideas into professional, platform-ready prompts for multiple AI generation services. The application uses heuristic analysis to categorize and enhance user input, generating optimized prompts for SDXL, ComfyUI, Midjourney v6, Pika Labs, and Runway ML. The system follows strict prompt structure ordering (quality → subject → style → lighting → composition → mood → color grade → extra tags) and includes comprehensive negative prompting, platform-specific configuration hints, database-backed API key authentication with expiry dates, daily usage quotas with individual user limits, Stripe webhook integration for automated key provisioning, comprehensive admin endpoints for manual key management, and Quick Share to Social functionality for automatic posting to Twitter/X, Instagram, and LinkedIn with branded Chaos Venice Productions content.
+This is a Flask-based Universal Prompt Optimizer that transforms rough creative ideas into professional, platform-ready prompts for multiple AI generation services. The application uses heuristic analysis to categorize and enhance user input, generating optimized prompts for SDXL, ComfyUI, Midjourney v6, Pika Labs, and Runway ML. The system follows strict prompt structure ordering (quality → subject → style → lighting → composition → mood → color grade → extra tags) and includes comprehensive negative prompting, platform-specific configuration hints, database-backed API key authentication with expiry dates, daily usage quotas with individual user limits, Stripe webhook integration for automated key provisioning, comprehensive admin endpoints for manual key management, Quick Share to Social functionality for automatic posting to Twitter/X, Instagram, and LinkedIn with branded Chaos Venice Productions content, and Automated Lead Follow-Up System with personalized email campaigns for download and hire us triggers.
 
 # User Preferences
 
@@ -48,13 +48,34 @@ Environment-based configuration is implemented for sensitive settings like sessi
 
 ### Email Configuration (choose one)
 **SendGrid (recommended):**
-- **SENDGRID_API_KEY**: SendGrid API key for email delivery
+- **SENDGRID_API_KEY**: SendGrid API key for automated lead follow-up emails
 
 **SMTP fallback:**
 - **SMTP_HOST**: SMTP server hostname
 - **SMTP_PORT**: SMTP server port (default: 587)
 - **SMTP_USER**: SMTP username
 - **SMTP_PASS**: SMTP password
+
+### Automated Lead Follow-Up System
+The application now includes a comprehensive email automation system that triggers personalized follow-up emails:
+
+**Download Trigger:**
+- Activates when leads submit email on share pages
+- Sends branded welcome email with image thumbnail and commission CTA
+- Subject: "Thanks for exploring Chaos Venice Productions"
+
+**Hire Us Trigger:**
+- Activates when leads submit contact form inquiries
+- Sends acknowledgment email with 24-hour response promise
+- Subject: "Your Creative Vision Awaits"
+
+**Email Features:**
+- Personalized content with lead name extraction
+- Branded HTML templates with Chaos Venice styling
+- Image thumbnails and generation parameters
+- Retry logic: 3 attempts over 24 hours (2min, 10min, 60min delays)
+- Comprehensive tracking in `sent_emails` table
+- Admin management endpoints for monitoring and manual resend
 
 ### Stripe Integration Setup
 Configure PLAN_MAP in app.py with your Stripe Price IDs:
@@ -78,6 +99,7 @@ The service provides comprehensive endpoints for prompt optimization and image g
 - **Marketing Funnels** (`/share/capture-lead`, `/contact`): Lead capture system and professional contact pages with Chaos Venice branding
 - **Admin Management** (`/admin/issue`, `/admin/revoke`, `/admin/update_limit`, `/admin/keys`, `/admin/leads`, `/admin/analytics`, `/admin/logs`): Manual API key operations, lead management, share page analytics, and social media tracking
 - **Social Media Integration** (`/social/auth/<platform>`, `/social/callback/<platform>`, `/social/share`, `/social/status`): OAuth authentication, secure token storage with encryption, direct posting to Twitter/X, Instagram, and LinkedIn with branded content and analytics tracking
+- **Automated Email System** (`/admin/emails`, `/admin/emails/stats`, `/admin/emails/resend`, `/admin/emails/retry-failed`): Lead follow-up automation with download and hire us triggers, personalized email templates with image thumbnails, retry logic with exponential backoff, comprehensive tracking and admin management
 - **Status Polling** (`/generate/comfy_status`): Real-time generation progress tracking for async workflows with authentication
 - **ZIP Downloads** (`/zip`): Bulk image packaging accepting image URLs and returning compressed archives
 - **Response Format**: Returns unified prompts plus platform-specific configurations (SDXL settings, ComfyUI workflows, Midjourney flags, video motion parameters)

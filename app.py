@@ -173,6 +173,20 @@ def _init_share_table():
             details TEXT,
             created_at TEXT NOT NULL
         )""")
+        # Email tracking table
+        db.execute("""CREATE TABLE IF NOT EXISTS sent_emails(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_id INTEGER,
+            email_to TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            trigger_type TEXT NOT NULL,  -- 'download', 'hire_us', 'manual'
+            status TEXT NOT NULL,        -- 'sent', 'failed', 'retry'
+            retry_count INTEGER DEFAULT 0,
+            share_token TEXT,
+            sent_at TEXT NOT NULL,
+            error_message TEXT,
+            FOREIGN KEY(lead_id) REFERENCES leads(id)
+        )""")
         db.commit()
 
 def _new_token(prefix="sh_"): 
@@ -198,12 +212,14 @@ def _track_share_visit(share_token):
     db.commit()
 
 def _capture_lead(email, share_token=None, source='share_download'):
-    """Capture lead information"""
+    """Capture lead information and return lead ID"""
     db = get_db()
-    db.execute("""INSERT INTO leads(email, share_token, ip_address, created_at, source)
-                  VALUES(?,?,?,?,?)""",
-               (email, share_token, _get_client_ip(), datetime.datetime.utcnow().isoformat(), source))
+    cur = db.execute("""INSERT INTO leads(email, share_token, ip_address, created_at, source)
+                        VALUES(?,?,?,?,?)""",
+                     (email, share_token, _get_client_ip(), datetime.datetime.utcnow().isoformat(), source))
+    lead_id = cur.lastrowid
     db.commit()
+    return lead_id
 
 def _log_error(level, message, details=None):
     """Log errors to database"""
@@ -387,6 +403,428 @@ def _resize_image_for_platform(image_url, platform):
     
     # For now, return original URL (in production, implement actual resizing)
     return image_url
+
+# --- EMAIL AUTOMATION SYSTEM ---
+
+def _send_email_sendgrid(to_email, subject, html_content, text_content=None):
+    """Send email using SendGrid API"""
+    import requests
+    
+    sendgrid_key = os.getenv('SENDGRID_API_KEY')
+    if not sendgrid_key:
+        return False, "SendGrid API key not configured"
+    
+    from_email = os.getenv('FROM_EMAIL', 'hello@chaosvenice.com')
+    
+    payload = {
+        "personalizations": [{
+            "to": [{"email": to_email}],
+            "subject": subject
+        }],
+        "from": {"email": from_email, "name": "Chaos Venice Productions"},
+        "content": [
+            {"type": "text/html", "value": html_content}
+        ]
+    }
+    
+    if text_content:
+        payload["content"].insert(0, {"type": "text/plain", "value": text_content})
+    
+    try:
+        response = requests.post(
+            'https://api.sendgrid.com/v3/mail/send',
+            headers={
+                'Authorization': f'Bearer {sendgrid_key}',
+                'Content-Type': 'application/json'
+            },
+            json=payload,
+            timeout=10
+        )
+        
+        if response.status_code == 202:
+            return True, "Email sent successfully"
+        else:
+            return False, f"SendGrid error: {response.status_code} - {response.text}"
+            
+    except Exception as e:
+        return False, f"Email sending failed: {str(e)}"
+
+def _send_email_smtp(to_email, subject, html_content, text_content=None):
+    """Send email using SMTP as fallback"""
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    
+    smtp_host = os.getenv('SMTP_HOST')
+    smtp_port = int(os.getenv('SMTP_PORT', '587'))
+    smtp_user = os.getenv('SMTP_USER')
+    smtp_pass = os.getenv('SMTP_PASS')
+    from_email = os.getenv('FROM_EMAIL', 'hello@chaosvenice.com')
+    
+    if not all([smtp_host, smtp_user, smtp_pass]):
+        return False, "SMTP credentials not configured"
+    
+    try:
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = subject
+        msg['From'] = f"Chaos Venice Productions <{from_email}>"
+        msg['To'] = to_email
+        
+        if text_content:
+            msg.attach(MIMEText(text_content, 'plain'))
+        msg.attach(MIMEText(html_content, 'html'))
+        
+        server = smtplib.SMTP(smtp_host, smtp_port)
+        server.starttls()
+        server.login(smtp_user, smtp_pass)
+        server.send_message(msg)
+        server.quit()
+        
+        return True, "Email sent successfully via SMTP"
+        
+    except Exception as e:
+        return False, f"SMTP sending failed: {str(e)}"
+
+def _send_email(to_email, subject, html_content, text_content=None):
+    """Send email using available service (SendGrid preferred, SMTP fallback)"""
+    # Try SendGrid first
+    if os.getenv('SENDGRID_API_KEY'):
+        success, message = _send_email_sendgrid(to_email, subject, html_content, text_content)
+        if success:
+            return True, message
+        _log_error("WARNING", "SendGrid failed, trying SMTP", message)
+    
+    # Fallback to SMTP
+    return _send_email_smtp(to_email, subject, html_content, text_content)
+
+def _generate_download_email(name, generation_title, image_url, share_url):
+    """Generate HTML email for download trigger"""
+    name_greeting = f"Hi {name}," if name else "Hello,"
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Thanks for exploring Chaos Venice Productions</title>
+        <style>
+            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; margin: 0; padding: 0; background: #0b0f14; color: #e7edf5; }}
+            .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+            .header {{ text-align: center; margin-bottom: 30px; }}
+            .logo {{ font-size: 24px; font-weight: 700; background: linear-gradient(45deg, #00ffff, #ff00ff); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }}
+            .tagline {{ color: #9fb2c7; margin-top: 8px; }}
+            .content {{ background: #111826; border-radius: 12px; padding: 30px; margin: 20px 0; }}
+            .image-preview {{ text-align: center; margin: 20px 0; }}
+            .image-preview img {{ max-width: 300px; height: auto; border-radius: 8px; border: 2px solid #1f2a3a; }}
+            .cta-button {{ display: inline-block; padding: 16px 32px; background: linear-gradient(45deg, #00ffff, #ff00ff); border-radius: 8px; color: #000; text-decoration: none; font-weight: 600; margin: 16px 8px; }}
+            .secondary-button {{ display: inline-block; padding: 16px 32px; background: transparent; border: 2px solid #00ffff; border-radius: 8px; color: #00ffff; text-decoration: none; font-weight: 600; margin: 16px 8px; }}
+            .footer {{ text-align: center; color: #9fb2c7; font-size: 14px; margin-top: 40px; }}
+            a {{ color: #4f9eff; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <div class="logo">CHAOS VENICE PRODUCTIONS</div>
+                <div class="tagline">Where Imagination Meets Precision</div>
+            </div>
+            
+            <div class="content">
+                <h2 style="color: #00ffff; margin-top: 0;">Thanks for exploring our AI creations!</h2>
+                
+                <p>{name_greeting}</p>
+                
+                <p>We noticed you downloaded "<strong>{generation_title}</strong>" – excellent taste! Our AI-powered art generation system creates stunning, professional-quality visuals that capture the perfect balance of creativity and technical precision.</p>
+                
+                <div class="image-preview">
+                    <img src="{image_url}" alt="{generation_title}">
+                </div>
+                
+                <p><strong>Ready to commission something truly unique?</strong></p>
+                
+                <p>Whether you need:</p>
+                <ul style="color: #9fb2c7;">
+                    <li>Custom art for your brand or project</li>
+                    <li>Concept art and visual development</li>
+                    <li>Marketing materials and social content</li>
+                    <li>Bespoke image collections</li>
+                </ul>
+                
+                <p>Our team specializes in transforming your creative vision into pixel-perfect reality.</p>
+                
+                <div style="text-align: center; margin: 30px 0;">
+                    <a href="mailto:orders@chaosvenice.com?subject=Custom Commission Inquiry" class="cta-button">Commission Custom Work</a>
+                    <a href="{share_url}" class="secondary-button">View Full Generation</a>
+                </div>
+                
+                <p style="color: #9fb2c7; font-size: 14px; margin-top: 30px;">
+                    <strong>What happens next?</strong><br>
+                    Reply to this email with your project details, and we'll send you a custom quote within 24 hours. Every commission includes unlimited revisions until it's perfect.
+                </p>
+            </div>
+            
+            <div class="footer">
+                <p>Chaos Venice Productions<br>
+                📧 <a href="mailto:orders@chaosvenice.com">orders@chaosvenice.com</a><br>
+                🌐 Where your imagination meets our precision</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    
+    text = f"""
+    Thanks for exploring Chaos Venice Productions!
+    
+    {name_greeting}
+    
+    We noticed you downloaded "{generation_title}" - excellent taste! Our AI-powered art generation system creates stunning, professional-quality visuals.
+    
+    Ready to commission something truly unique?
+    
+    Whether you need custom art for your brand, concept art, marketing materials, or bespoke image collections, our team specializes in transforming your creative vision into pixel-perfect reality.
+    
+    Commission Custom Work: mailto:orders@chaosvenice.com?subject=Custom Commission Inquiry
+    View Full Generation: {share_url}
+    
+    What happens next?
+    Reply to this email with your project details, and we'll send you a custom quote within 24 hours. Every commission includes unlimited revisions until it's perfect.
+    
+    Chaos Venice Productions
+    orders@chaosvenice.com
+    Where your imagination meets our precision
+    """
+    
+    return html, text
+
+def _generate_hire_us_email(name, inquiry_details):
+    """Generate HTML email for hire us trigger"""
+    name_greeting = f"Hi {name}," if name else "Hello,"
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Your Creative Vision Awaits</title>
+        <style>
+            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; margin: 0; padding: 0; background: #0b0f14; color: #e7edf5; }}
+            .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+            .header {{ text-align: center; margin-bottom: 30px; }}
+            .logo {{ font-size: 24px; font-weight: 700; background: linear-gradient(45deg, #00ffff, #ff00ff); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }}
+            .tagline {{ color: #9fb2c7; margin-top: 8px; }}
+            .content {{ background: #111826; border-radius: 12px; padding: 30px; margin: 20px 0; }}
+            .portfolio-grid {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; margin: 20px 0; }}
+            .portfolio-item {{ background: #1f2a3a; border-radius: 8px; padding: 16px; text-align: center; }}
+            .cta-button {{ display: inline-block; padding: 16px 32px; background: linear-gradient(45deg, #00ffff, #ff00ff); border-radius: 8px; color: #000; text-decoration: none; font-weight: 600; margin: 16px 8px; }}
+            .timeline {{ background: rgba(0,255,255,0.05); border-left: 3px solid #00ffff; padding: 20px; margin: 20px 0; border-radius: 8px; }}
+            .footer {{ text-align: center; color: #9fb2c7; font-size: 14px; margin-top: 40px; }}
+            a {{ color: #4f9eff; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <div class="logo">CHAOS VENICE PRODUCTIONS</div>
+                <div class="tagline">Where Imagination Meets Precision</div>
+            </div>
+            
+            <div class="content">
+                <h2 style="color: #00ffff; margin-top: 0;">Your Creative Vision Awaits ✨</h2>
+                
+                <p>{name_greeting}</p>
+                
+                <p>Thank you for reaching out about commissioning custom work with Chaos Venice Productions! We're excited to learn about your creative project and help bring your vision to life.</p>
+                
+                <div class="timeline">
+                    <h3 style="color: #ff00ff; margin-top: 0;">What happens next:</h3>
+                    <p><strong>Within 24 hours:</strong> Our creative team will review your inquiry and send you a detailed project proposal with timeline and pricing.</p>
+                    <p><strong>Your input matters:</strong> We'll work closely with you to refine every detail until it perfectly matches your vision.</p>
+                    <p><strong>Unlimited revisions:</strong> Every commission includes as many iterations as needed to get it just right.</p>
+                </div>
+                
+                <h3 style="color: #00ffff;">Recent Work Highlights</h3>
+                <div class="portfolio-grid">
+                    <div class="portfolio-item">
+                        <h4 style="color: #ff00ff; margin: 0 0 8px 0;">Brand Identity</h4>
+                        <p style="font-size: 14px; color: #9fb2c7; margin: 0;">Complete visual systems</p>
+                    </div>
+                    <div class="portfolio-item">
+                        <h4 style="color: #ff00ff; margin: 0 0 8px 0;">Concept Art</h4>
+                        <p style="font-size: 14px; color: #9fb2c7; margin: 0;">Character & environment design</p>
+                    </div>
+                    <div class="portfolio-item">
+                        <h4 style="color: #ff00ff; margin: 0 0 8px 0;">Marketing Assets</h4>
+                        <p style="font-size: 14px; color: #9fb2c7; margin: 0;">Social media & campaign visuals</p>
+                    </div>
+                    <div class="portfolio-item">
+                        <h4 style="color: #ff00ff; margin: 0 0 8px 0;">Product Visualization</h4>
+                        <p style="font-size: 14px; color: #9fb2c7; margin: 0;">3D renders & lifestyle shots</p>
+                    </div>
+                </div>
+                
+                <p>Every project receives our signature blend of cutting-edge AI technology and human artistic expertise to ensure truly exceptional results.</p>
+                
+                <div style="text-align: center; margin: 30px 0;">
+                    <a href="mailto:orders@chaosvenice.com?subject=Re: Commission Inquiry - Urgent" class="cta-button">Questions? Reply Now</a>
+                </div>
+                
+                <p style="color: #9fb2c7; font-size: 14px; background: rgba(255,0,255,0.05); padding: 16px; border-radius: 8px; border-left: 3px solid #ff00ff;">
+                    <strong>Pro tip:</strong> The more details you share about your vision, timeline, and intended use, the more accurately we can tailor our proposal to your needs.
+                </p>
+            </div>
+            
+            <div class="footer">
+                <p>Chaos Venice Productions<br>
+                📧 <a href="mailto:orders@chaosvenice.com">orders@chaosvenice.com</a><br>
+                🎨 Transforming imagination into reality since day one</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    
+    text = f"""
+    Your Creative Vision Awaits
+    
+    {name_greeting}
+    
+    Thank you for reaching out about commissioning custom work with Chaos Venice Productions! We're excited to learn about your creative project and help bring your vision to life.
+    
+    What happens next:
+    - Within 24 hours: Our creative team will review your inquiry and send you a detailed project proposal
+    - Your input matters: We'll work closely with you to refine every detail
+    - Unlimited revisions: Every commission includes as many iterations as needed
+    
+    Recent Work Highlights:
+    • Brand Identity - Complete visual systems
+    • Concept Art - Character & environment design  
+    • Marketing Assets - Social media & campaign visuals
+    • Product Visualization - 3D renders & lifestyle shots
+    
+    Every project receives our signature blend of cutting-edge AI technology and human artistic expertise.
+    
+    Questions? Reply to: orders@chaosvenice.com
+    
+    Pro tip: The more details you share about your vision, timeline, and intended use, the more accurately we can tailor our proposal to your needs.
+    
+    Chaos Venice Productions
+    orders@chaosvenice.com
+    Transforming imagination into reality since day one
+    """
+    
+    return html, text
+
+def _send_automated_email(lead_id, email_to, trigger_type, share_token=None, generation_data=None):
+    """Send automated follow-up email with retry logic"""
+    # Get lead information for personalization
+    db = get_db()
+    cur = db.execute("SELECT email, share_token, created_at FROM leads WHERE id=?", (lead_id,))
+    lead_row = cur.fetchone()
+    
+    # Extract name from email (simple heuristic)
+    name = email_to.split('@')[0].replace('.', ' ').replace('_', ' ').title() if '@' in email_to else None
+    
+    if trigger_type == 'download':
+        # Get share information
+        if share_token:
+            cur = db.execute("SELECT title, meta_json FROM shares WHERE token=?", (share_token,))
+            share_row = cur.fetchone()
+            if share_row:
+                title = share_row[0] or "AI Generated Art"
+                try:
+                    meta = json.loads(share_row[1] or '{}')
+                    first_image = meta.get('images', [''])[0] or 'https://via.placeholder.com/300x300?text=AI+Art'
+                except:
+                    first_image = 'https://via.placeholder.com/300x300?text=AI+Art'
+                
+                base_url = os.getenv("PUBLIC_BASE_URL", "")
+                share_url = f"{base_url}/s/{share_token}" if base_url else f"/s/{share_token}"
+                
+                html_content, text_content = _generate_download_email(name, title, first_image, share_url)
+                subject = "Thanks for exploring Chaos Venice Productions"
+            else:
+                return False, "Share not found"
+        else:
+            return False, "No share token provided for download trigger"
+            
+    elif trigger_type == 'hire_us':
+        inquiry_details = generation_data or {}
+        html_content, text_content = _generate_hire_us_email(name, inquiry_details)
+        subject = "Your Creative Vision Awaits"
+    
+    elif trigger_type == 'manual':
+        # Manual emails would have custom content passed in generation_data
+        subject = generation_data.get('subject', 'Message from Chaos Venice Productions')
+        html_content = generation_data.get('html_content', '<p>Custom message content</p>')
+        text_content = generation_data.get('text_content', 'Custom message content')
+    
+    else:
+        return False, f"Unknown trigger type: {trigger_type}"
+    
+    # Attempt to send email
+    success, message = _send_email(email_to, subject, html_content, text_content)
+    
+    # Log the email attempt
+    status = 'sent' if success else 'failed'
+    db.execute("""INSERT INTO sent_emails(lead_id, email_to, subject, trigger_type, status, share_token, sent_at, error_message)
+                  VALUES(?,?,?,?,?,?,?,?)""",
+               (lead_id, email_to, subject, trigger_type, status, share_token, 
+                datetime.datetime.utcnow().isoformat(), None if success else message))
+    db.commit()
+    
+    if not success:
+        _log_error("ERROR", f"Email failed for lead {lead_id}", f"To: {email_to}, Error: {message}")
+    
+    return success, message
+
+def _retry_failed_emails():
+    """Retry failed emails with exponential backoff"""
+    db = get_db()
+    
+    # Find emails that failed and need retry (max 3 attempts, with delays)
+    twenty_four_hours_ago = (datetime.datetime.utcnow() - datetime.timedelta(hours=24)).isoformat()
+    two_minutes_ago = (datetime.datetime.utcnow() - datetime.timedelta(minutes=2)).isoformat()
+    
+    cur = db.execute("""SELECT id, lead_id, email_to, subject, trigger_type, share_token, retry_count, sent_at
+                        FROM sent_emails 
+                        WHERE status='failed' 
+                        AND retry_count < 3 
+                        AND sent_at > ? 
+                        AND sent_at < ?
+                        ORDER BY sent_at ASC LIMIT 10""", 
+                     (twenty_four_hours_ago, two_minutes_ago))
+    
+    failed_emails = cur.fetchall()
+    
+    for email_record in failed_emails:
+        email_id, lead_id, email_to, subject, trigger_type, share_token, retry_count, sent_at = email_record
+        
+        # Calculate retry delay: 2 minutes, 10 minutes, 60 minutes
+        retry_delays = [2, 10, 60]  # minutes
+        required_delay = retry_delays[min(retry_count, len(retry_delays)-1)]
+        
+        sent_time = datetime.datetime.fromisoformat(sent_at)
+        next_retry_time = sent_time + datetime.timedelta(minutes=required_delay)
+        
+        if datetime.datetime.utcnow() >= next_retry_time:
+            # Attempt retry
+            success, message = _send_automated_email(lead_id, email_to, trigger_type, share_token)
+            
+            if success:
+                # Update original record to 'sent'
+                db.execute("UPDATE sent_emails SET status='sent', retry_count=? WHERE id=?", 
+                          (retry_count + 1, email_id))
+                _log_error("INFO", f"Email retry succeeded for lead {lead_id}", f"Attempt {retry_count + 1}")
+            else:
+                # Update retry count
+                db.execute("UPDATE sent_emails SET retry_count=?, error_message=? WHERE id=?", 
+                          (retry_count + 1, message, email_id))
+                _log_error("WARNING", f"Email retry {retry_count + 1} failed for lead {lead_id}", message)
+            
+            db.commit()
 
 def _today():
     return datetime.date.today().isoformat()
@@ -1223,7 +1661,7 @@ def share_delete():
 
 @app.post("/share/capture-lead")
 def share_capture_lead():
-    """Capture lead email from share page downloads"""
+    """Capture lead email from share page downloads and send automated follow-up"""
     data = request.get_json(force=True)
     email = (data.get("email") or "").strip()
     share_token = (data.get("share_token") or "").strip()
@@ -1231,8 +1669,205 @@ def share_capture_lead():
     if not email or "@" not in email:
         return jsonify({"error": "Valid email required"}), 400
     
-    _capture_lead(email, share_token, "share_download")
-    return jsonify({"ok": True, "message": "Email captured successfully"})
+    # Capture lead and get the ID
+    lead_id = _capture_lead(email, share_token, "share_download")
+    
+    # Send automated follow-up email (download trigger)
+    try:
+        success, message = _send_automated_email(lead_id, email, 'download', share_token)
+        if success:
+            _log_error("INFO", f"Download email sent to lead {lead_id}", f"Email: {email}")
+        else:
+            _log_error("WARNING", f"Download email failed for lead {lead_id}", message)
+    except Exception as e:
+        _log_error("ERROR", f"Email automation error for lead {lead_id}", str(e))
+    
+    return jsonify({"ok": True, "message": "Email captured successfully! Check your inbox for exclusive content."})
+
+@app.route('/contact', methods=['POST'])
+def submit_contact_form():
+    """Handle contact form submission and send hire us follow-up email"""
+    name = request.form.get('name', '').strip()
+    email = request.form.get('email', '').strip()
+    message = request.form.get('message', '').strip()
+    
+    if not email or "@" not in email:
+        return jsonify({"error": "Valid email required"}), 400
+    
+    if not message:
+        return jsonify({"error": "Message required"}), 400
+    
+    # Capture lead for hire us inquiry
+    try:
+        lead_id = _capture_lead(email, None, "contact_form")
+        
+        # Send automated follow-up email (hire us trigger)
+        inquiry_data = {
+            'name': name,
+            'email': email,
+            'message': message,
+            'submitted_at': datetime.datetime.utcnow().isoformat()
+        }
+        
+        success, message_result = _send_automated_email(lead_id, email, 'hire_us', None, inquiry_data)
+        if success:
+            _log_error("INFO", f"Hire us email sent to lead {lead_id}", f"Email: {email}")
+        else:
+            _log_error("WARNING", f"Hire us email failed for lead {lead_id}", message_result)
+            
+    except Exception as e:
+        _log_error("ERROR", f"Contact form email automation error", str(e))
+    
+    return jsonify({"ok": True, "message": "Thank you for your inquiry! We'll reply within 24 hours with a detailed proposal."})
+
+# --- ADMIN EMAIL MANAGEMENT ENDPOINTS ---
+
+@app.route('/admin/emails')
+def admin_emails():
+    """View all sent emails with status and retry information"""
+    admin_token = request.args.get('admin_token')
+    if admin_token != os.getenv('ADMIN_TOKEN'):
+        return jsonify({"error": "Invalid admin token"}), 401
+    
+    db = get_db()
+    cur = db.execute("""SELECT e.id, e.email_to, e.subject, e.trigger_type, e.status, 
+                               e.retry_count, e.sent_at, e.error_message, l.email as lead_email
+                        FROM sent_emails e 
+                        LEFT JOIN leads l ON e.lead_id = l.id
+                        ORDER BY e.sent_at DESC LIMIT 100""")
+    
+    emails = []
+    for row in cur.fetchall():
+        emails.append({
+            "id": row[0],
+            "email_to": row[1], 
+            "subject": row[2],
+            "trigger_type": row[3],
+            "status": row[4],
+            "retry_count": row[5],
+            "sent_at": row[6],
+            "error_message": row[7],
+            "lead_email": row[8]
+        })
+    
+    return jsonify({
+        "emails": emails,
+        "total_count": len(emails),
+        "stats": {
+            "sent": len([e for e in emails if e["status"] == "sent"]),
+            "failed": len([e for e in emails if e["status"] == "failed"]),
+            "retrying": len([e for e in emails if e["status"] == "retry"])
+        }
+    })
+
+@app.route('/admin/emails/resend', methods=['POST'])
+def admin_resend_email():
+    """Manually resend a failed email"""
+    admin_token = request.form.get('admin_token')
+    if admin_token != os.getenv('ADMIN_TOKEN'):
+        return jsonify({"error": "Invalid admin token"}), 401
+    
+    email_id = request.form.get('email_id')
+    if not email_id:
+        return jsonify({"error": "Email ID required"}), 400
+    
+    try:
+        db = get_db()
+        cur = db.execute("""SELECT lead_id, email_to, trigger_type, share_token 
+                            FROM sent_emails WHERE id=?""", (email_id,))
+        email_record = cur.fetchone()
+        
+        if not email_record:
+            return jsonify({"error": "Email not found"}), 404
+        
+        lead_id, email_to, trigger_type, share_token = email_record
+        
+        # Attempt to resend
+        success, message = _send_automated_email(lead_id, email_to, trigger_type, share_token)
+        
+        if success:
+            # Update original record
+            db.execute("UPDATE sent_emails SET status='sent' WHERE id=?", (email_id,))
+            db.commit()
+            return jsonify({"ok": True, "message": "Email resent successfully"})
+        else:
+            return jsonify({"error": f"Resend failed: {message}"}), 500
+            
+    except Exception as e:
+        return jsonify({"error": f"Resend error: {str(e)}"}), 500
+
+@app.route('/admin/emails/stats')
+def admin_email_stats():
+    """Get email automation statistics"""
+    admin_token = request.args.get('admin_token')
+    if admin_token != os.getenv('ADMIN_TOKEN'):
+        return jsonify({"error": "Invalid admin token"}), 401
+    
+    db = get_db()
+    
+    # Overall stats
+    cur = db.execute("SELECT COUNT(*) FROM sent_emails")
+    total_emails = cur.fetchone()[0]
+    
+    cur = db.execute("SELECT status, COUNT(*) FROM sent_emails GROUP BY status")
+    status_counts = {row[0]: row[1] for row in cur.fetchall()}
+    
+    # Trigger type breakdown
+    cur = db.execute("SELECT trigger_type, COUNT(*) FROM sent_emails GROUP BY trigger_type")
+    trigger_counts = {row[0]: row[1] for row in cur.fetchall()}
+    
+    # Recent activity (last 24 hours)
+    yesterday = (datetime.datetime.utcnow() - datetime.timedelta(hours=24)).isoformat()
+    cur = db.execute("SELECT COUNT(*) FROM sent_emails WHERE sent_at > ?", (yesterday,))
+    recent_emails = cur.fetchone()[0]
+    
+    # Failed emails needing retry
+    cur = db.execute("SELECT COUNT(*) FROM sent_emails WHERE status='failed' AND retry_count < 3")
+    retry_pending = cur.fetchone()[0]
+    
+    return jsonify({
+        "total_emails": total_emails,
+        "status_breakdown": status_counts,
+        "trigger_breakdown": trigger_counts,
+        "recent_24h": recent_emails,
+        "retry_pending": retry_pending,
+        "success_rate": round(status_counts.get("sent", 0) / max(total_emails, 1) * 100, 1)
+    })
+
+# Background email retry scheduler (called periodically)
+def _run_email_retry_scheduler():
+    """Background task to retry failed emails"""
+    try:
+        _retry_failed_emails()
+    except Exception as e:
+        _log_error("ERROR", "Email retry scheduler failed", str(e))
+
+# Add endpoint to manually trigger email retries (for testing/admin)
+@app.route('/admin/emails/retry-failed', methods=['POST'])
+def admin_retry_failed_emails():
+    """Manually trigger retry of failed emails"""
+    admin_token = request.form.get('admin_token')
+    if admin_token != os.getenv('ADMIN_TOKEN'):
+        return jsonify({"error": "Invalid admin token"}), 401
+    
+    try:
+        _run_email_retry_scheduler()
+        return jsonify({"ok": True, "message": "Email retry scheduler executed"})
+    except Exception as e:
+        return jsonify({"error": f"Retry failed: {str(e)}"}), 500
+
+# Hook into requests to periodically run email retries
+@app.before_request
+def before_request():
+    """Run background tasks occasionally"""
+    import random
+    
+    # Run email retry scheduler on ~2% of requests (avoids blocking)
+    if random.random() < 0.02:
+        try:
+            _run_email_retry_scheduler()
+        except:
+            pass  # Don't block requests if retry fails
 
 @app.get("/contact")
 def contact_page():
@@ -1301,11 +1936,76 @@ body{font-family:'Inter',system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial
     </div>
   </div>
   
-  <div class="card" style="text-align:center">
-    <h3 style="color:#00ffff">Ready to Start?</h3>
-    <p style="margin-bottom:20px">Tell us about your project and we'll get back to you within 24 hours.</p>
-    <a href="mailto:orders@chaosvenice.com?subject=New Project Inquiry" style="display:inline-block;padding:16px 32px;background:linear-gradient(45deg,#00ffff,#ff00ff);border-radius:12px;color:#000;text-decoration:none;font-weight:600">Start a Project</a>
+  <div class="card">
+    <h3 style="color:#00ffff;text-align:center">Get Started - Tell Us About Your Project</h3>
+    <p style="text-align:center;color:#9fb2c7;margin-bottom:30px">Fill out the form below and we'll get back to you within 24 hours with a detailed proposal.</p>
+    
+    <form id="contactForm" onsubmit="submitContactForm(event)" style="max-width:600px;margin:0 auto">
+      <div style="margin-bottom:20px">
+        <label style="display:block;margin-bottom:8px;color:#00ffff;font-weight:600">Name</label>
+        <input type="text" name="name" required style="width:100%;padding:12px;border:1px solid #1f2a3a;border-radius:8px;background:rgba(0,0,0,0.3);color:#e7edf5;font-size:16px">
+      </div>
+      
+      <div style="margin-bottom:20px">
+        <label style="display:block;margin-bottom:8px;color:#00ffff;font-weight:600">Email *</label>
+        <input type="email" name="email" required style="width:100%;padding:12px;border:1px solid #1f2a3a;border-radius:8px;background:rgba(0,0,0,0.3);color:#e7edf5;font-size:16px">
+      </div>
+      
+      <div style="margin-bottom:20px">
+        <label style="display:block;margin-bottom:8px;color:#00ffff;font-weight:600">Project Details *</label>
+        <textarea name="message" required rows="5" placeholder="Tell us about your project: What type of content do you need? What's your timeline? Any specific requirements or style preferences?" style="width:100%;padding:12px;border:1px solid #1f2a3a;border-radius:8px;background:rgba(0,0,0,0.3);color:#e7edf5;font-size:16px;resize:vertical"></textarea>
+      </div>
+      
+      <div style="text-align:center">
+        <button type="submit" style="padding:16px 32px;background:linear-gradient(45deg,#00ffff,#ff00ff);border:none;border-radius:12px;color:#000;font-weight:600;font-size:16px;cursor:pointer">Send Inquiry</button>
+      </div>
+    </form>
+    
+    <div id="contactMessage" style="margin-top:20px;padding:15px;border-radius:8px;display:none;text-align:center"></div>
   </div>
+  
+  <script>
+  function submitContactForm(event) {
+    event.preventDefault();
+    
+    const form = event.target;
+    const formData = new FormData(form);
+    const messageDiv = document.getElementById('contactMessage');
+    const submitBtn = form.querySelector('button[type="submit"]');
+    
+    submitBtn.textContent = 'Sending...';
+    submitBtn.disabled = true;
+    
+    fetch('/contact', {
+      method: 'POST',
+      body: formData
+    })
+    .then(response => response.json())
+    .then(data => {
+      if (data.ok) {
+        messageDiv.style.display = 'block';
+        messageDiv.style.background = 'rgba(0,255,0,0.1)';
+        messageDiv.style.border = '1px solid #00ff00';
+        messageDiv.style.color = '#00ff00';
+        messageDiv.textContent = data.message;
+        form.reset();
+      } else {
+        throw new Error(data.error || 'Unknown error');
+      }
+    })
+    .catch(error => {
+      messageDiv.style.display = 'block';
+      messageDiv.style.background = 'rgba(255,0,0,0.1)';
+      messageDiv.style.border = '1px solid #ff0000';
+      messageDiv.style.color = '#ff0000';
+      messageDiv.textContent = 'Error: ' + error.message;
+    })
+    .finally(() => {
+      submitBtn.textContent = 'Send Inquiry';
+      submitBtn.disabled = false;
+    });
+  }
+  </script>
 </div>
 </body></html>"""
     return Response(html, 200, mimetype="text/html")
