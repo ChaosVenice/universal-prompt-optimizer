@@ -1,6 +1,6 @@
 # Overview
 
-This is a Flask-based Universal Prompt Optimizer that transforms rough creative ideas into professional, platform-ready prompts for multiple AI generation services. The application uses heuristic analysis to categorize and enhance user input, generating optimized prompts for SDXL, ComfyUI, Midjourney v6, Pika Labs, and Runway ML. The system follows strict prompt structure ordering (quality → subject → style → lighting → composition → mood → color grade → extra tags) and includes comprehensive negative prompting, platform-specific configuration hints, database-backed API key authentication with expiry dates, daily usage quotas with individual user limits, Stripe webhook integration for automated key provisioning, comprehensive admin endpoints for manual key management, Quick Share to Social functionality for automatic posting to Twitter/X, Instagram, and LinkedIn with branded Chaos Venice Productions content, and Automated Lead Follow-Up System with personalized email campaigns for download and hire us triggers.
+This is a Flask-based Universal Prompt Optimizer that transforms rough creative ideas into professional, platform-ready prompts for multiple AI generation services. The application uses heuristic analysis to categorize and enhance user input, generating optimized prompts for SDXL, ComfyUI, Midjourney v6, Pika Labs, and Runway ML. The system follows strict prompt structure ordering (quality → subject → style → lighting → composition → mood → color grade → extra tags) and includes comprehensive negative prompting, platform-specific configuration hints, database-backed API key authentication with expiry dates, daily usage quotas with individual user limits, Stripe webhook integration for automated key provisioning, comprehensive admin endpoints for manual key management, Quick Share to Social functionality for automatic posting to Twitter/X, Instagram, and LinkedIn with branded Chaos Venice Productions content, Automated Lead Follow-Up System with personalized email campaigns for download and hire us triggers, and Dynamic Portfolio Engine with Auto-Sell Flow that transforms every generated asset into a passive sales tool with automatic curation, engagement analytics, and direct revenue paths through commission orders and image licensing.
 
 # User Preferences
 
@@ -113,6 +113,10 @@ The service provides comprehensive endpoints for prompt optimization and image g
 - **Bootstrap Demo**: Auto-created demo123 key with 50 daily generations for immediate testing
 - **Error Handling**: Comprehensive validation with loading states and user-friendly error messages
 - **Execution Hints**: Built-in troubleshooting guidance for common generation issues (faces, motion warping, busy outputs)
+- **Dynamic Portfolio Engine**: Auto-curated gallery with engagement-based ranking, SEO optimization, and performance analytics
+- **Auto-Sell Flow**: Commission order forms and image licensing with $49-$1499 pricing tiers and automatic lead conversion
+- **Portfolio Analytics**: Real-time tracking of views, downloads, social shares, and revenue generation per asset
+- **Revenue Integration**: Direct monetization through similar artwork orders and multi-tier licensing (Personal $49, Commercial $199, Exclusive $999)
 
 # External Dependencies
 

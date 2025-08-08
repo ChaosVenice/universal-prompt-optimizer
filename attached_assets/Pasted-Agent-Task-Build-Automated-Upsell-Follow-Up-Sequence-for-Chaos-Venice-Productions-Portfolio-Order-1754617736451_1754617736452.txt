@@ -1,0 +1,78 @@
+Agent Task:
+Build Automated Upsell & Follow-Up Sequence for Chaos Venice Productions Portfolio Orders
+
+Goal:
+Maximize revenue from every portfolio lead by automatically presenting upsell offers and follow-up sequences after a user expresses purchase intent.
+
+Core Features
+Trigger Points
+
+Any click on “Order Similar” or “Commission a Project” instantly triggers the upsell workflow.
+
+Trigger also fires when a lead downloads a ZIP file from a share page.
+
+Upsell Offer Page
+
+Immediately after intent, user is redirected to an Upsell Page with:
+
+Large preview of the image they’re ordering.
+
+Tiered offer table (e.g., Basic Pack, Premium Pack, Full Commercial License).
+
+Scarcity elements (“Offer valid for 24 hours” countdown timer).
+
+Payment buttons linked to Stripe Checkout.
+
+Email Follow-Up Sequence
+
+If purchase not completed:
+
+Hour 1: Email reminder with image preview and “Complete Your Order” button.
+
+Hour 12: Email offering a small discount or bonus asset if they purchase now.
+
+Day 2: Email with “Behind the Scenes” insight about the creation process to re-engage.
+
+Day 4: Final “Last Chance” email before the offer expires.
+
+Post-Purchase Upsell
+
+After any purchase, redirect to Post-Purchase Offer Page:
+
+“Since you loved this, why not get an exclusive 10-image set in the same style?”
+
+One-click Stripe checkout, discounted price.
+
+Lead Capture Integration
+
+All triggered leads are stored in SQLite + synced with our email marketing service (e.g., MailerLite, ConvertKit, or custom SMTP).
+
+Include tag data for what image/offer they clicked so follow-up can be personalized.
+
+Admin Dashboard Controls
+
+Set offer tiers, pricing, discount timers.
+
+View upsell conversion rates, abandoned carts, completed sales.
+
+Technical Requirements
+Integrates with current SQLite lead system and Stripe API.
+
+Emails use the Chaos Venice Productions branding (dark, neon teal/magenta cinematic theme).
+
+Upsell pages mobile-responsive and optimized for speed.
+
+Countdown timers persist between sessions using localStorage and server timestamps.
+
+Acceptance Criteria:
+
+Any purchase intent triggers immediate upsell workflow.
+
+System captures & follows up on every abandoned checkout.
+
+Post-purchase upsells are live and converting.
+
+Admin can monitor performance and adjust offers without code edits.
+
+This turns every casual portfolio viewer into a high-value buyer by pushing them through a proven revenue-maximizing funnel automatically.
+

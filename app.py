@@ -187,7 +187,177 @@ def _init_share_table():
             error_message TEXT,
             FOREIGN KEY(lead_id) REFERENCES leads(id)
         )""")
+        
+        # Portfolio analytics table
+        db.execute("""CREATE TABLE IF NOT EXISTS portfolio_analytics(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            share_token TEXT NOT NULL,
+            action_type TEXT NOT NULL,  -- 'view', 'click', 'order', 'license'
+            ip_address TEXT,
+            user_agent TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(share_token) REFERENCES shares(token)
+        )""")
+        
+        # Featured portfolio table
+        db.execute("""CREATE TABLE IF NOT EXISTS featured_portfolio(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            share_token TEXT NOT NULL UNIQUE,
+            engagement_score REAL DEFAULT 0,
+            total_views INTEGER DEFAULT 0,
+            total_downloads INTEGER DEFAULT 0,
+            total_social_shares INTEGER DEFAULT 0,
+            featured_at TEXT NOT NULL,
+            auto_selected BOOLEAN DEFAULT TRUE,
+            seo_title TEXT,
+            seo_description TEXT,
+            FOREIGN KEY(share_token) REFERENCES shares(token)
+        )""")
+        
+        # Portfolio orders table
+        db.execute("""CREATE TABLE IF NOT EXISTS portfolio_orders(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            share_token TEXT NOT NULL,
+            order_type TEXT NOT NULL,    -- 'similar', 'license', 'commission'
+            customer_email TEXT NOT NULL,
+            customer_name TEXT,
+            order_details TEXT,          -- JSON with parameters and requirements
+            price_cents INTEGER,
+            status TEXT DEFAULT 'pending', -- 'pending', 'paid', 'completed', 'cancelled'
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(share_token) REFERENCES shares(token)
+        )""")
+        
         db.commit()
+
+# --- PORTFOLIO ENGINE FUNCTIONS ---
+
+def _track_portfolio_action(share_token, action_type):
+    """Track user actions on portfolio items"""
+    db = get_db()
+    db.execute("""INSERT INTO portfolio_analytics(share_token, action_type, ip_address, user_agent, created_at)
+                  VALUES(?,?,?,?,?)""",
+               (share_token, action_type, _get_client_ip(), 
+                request.headers.get('User-Agent', ''), datetime.datetime.utcnow().isoformat()))
+    db.commit()
+
+def _calculate_engagement_score(share_token):
+    """Calculate engagement score for a share based on various metrics"""
+    db = get_db()
+    
+    # Get share visits
+    cur = db.execute("SELECT COUNT(*) FROM share_visits WHERE share_token=?", (share_token,))
+    visits = cur.fetchone()[0]
+    
+    # Get downloads from leads
+    cur = db.execute("SELECT COUNT(*) FROM leads WHERE share_token=?", (share_token,))
+    downloads = cur.fetchone()[0]
+    
+    # Get social shares
+    cur = db.execute("SELECT COUNT(*) FROM social_shares WHERE share_token=? AND success=1", (share_token,))
+    social_shares = cur.fetchone()[0]
+    
+    # Get portfolio views/clicks
+    cur = db.execute("SELECT COUNT(*) FROM portfolio_analytics WHERE share_token=? AND action_type IN ('view', 'click')", (share_token,))
+    portfolio_actions = cur.fetchone()[0]
+    
+    # Get orders
+    cur = db.execute("SELECT COUNT(*) FROM portfolio_orders WHERE share_token=?", (share_token,))
+    orders = cur.fetchone()[0]
+    
+    # Calculate weighted score
+    engagement_score = (
+        visits * 1.0 +           # Base visits
+        downloads * 5.0 +        # Email captures are valuable
+        social_shares * 10.0 +   # Social shares amplify reach
+        portfolio_actions * 2.0 + # Portfolio engagement
+        orders * 50.0            # Orders are most valuable
+    )
+    
+    return engagement_score, visits, downloads, social_shares
+
+def _generate_seo_content(share_data):
+    """Generate SEO title and description for portfolio items"""
+    try:
+        meta = json.loads(share_data.get('meta_json', '{}'))
+        title = share_data.get('title', 'AI Generated Art')
+        prompt = meta.get('positive_prompt', '')
+        
+        # Extract key terms from prompt for SEO
+        key_terms = []
+        if 'cinematic' in prompt.lower():
+            key_terms.append('cinematic')
+        if 'portrait' in prompt.lower():
+            key_terms.append('portrait')
+        if 'landscape' in prompt.lower():
+            key_terms.append('landscape')
+        if 'concept art' in prompt.lower():
+            key_terms.append('concept art')
+        if 'digital art' in prompt.lower():
+            key_terms.append('digital art')
+        
+        style_terms = ['hyperrealistic', 'fantasy', 'sci-fi', 'abstract', 'minimalist']
+        for term in style_terms:
+            if term in prompt.lower():
+                key_terms.append(term)
+                break
+        
+        # Generate SEO title
+        if key_terms:
+            seo_title = f"{title} - {' '.join(key_terms[:3]).title()} AI Art by Chaos Venice Productions"
+        else:
+            seo_title = f"{title} - Professional AI Art by Chaos Venice Productions"
+        
+        # Generate SEO description
+        seo_description = f"Professional AI-generated artwork: {title}. "
+        if key_terms:
+            seo_description += f"Features {', '.join(key_terms[:2])} styling. "
+        seo_description += "Commission similar works or license for commercial use. Created by Chaos Venice Productions using advanced AI technology."
+        
+        return seo_title[:60], seo_description[:160]
+        
+    except:
+        return f"{share_data.get('title', 'AI Art')} - Chaos Venice Productions", "Professional AI-generated artwork available for licensing and custom commissions."
+
+def _update_featured_portfolio():
+    """Automatically update featured portfolio based on engagement"""
+    db = get_db()
+    
+    # Get all shares older than 1 hour (to allow initial engagement)
+    one_hour_ago = (datetime.datetime.utcnow() - datetime.timedelta(hours=1)).isoformat()
+    cur = db.execute("""SELECT token, title, meta_json, created_at FROM shares 
+                        WHERE created_at < ? AND expires_at > ?""", 
+                     (one_hour_ago, datetime.datetime.utcnow().isoformat()))
+    
+    shares = cur.fetchall()
+    
+    for share in shares:
+        token, title, meta_json, created_at = share
+        
+        # Calculate engagement score
+        score, views, downloads, social_shares = _calculate_engagement_score(token)
+        
+        # Only feature if there's meaningful engagement (score > 10)
+        if score > 10:
+            # Generate SEO content
+            share_data = {'title': title, 'meta_json': meta_json}
+            seo_title, seo_description = _generate_seo_content(share_data)
+            
+            # Insert or update featured portfolio
+            db.execute("""INSERT OR REPLACE INTO featured_portfolio
+                          (share_token, engagement_score, total_views, total_downloads, 
+                           total_social_shares, featured_at, seo_title, seo_description)
+                          VALUES(?,?,?,?,?,?,?,?)""",
+                       (token, score, views, downloads, social_shares, 
+                        datetime.datetime.utcnow().isoformat(), seo_title, seo_description))
+    
+    db.commit()
+    
+    # Cleanup: Remove low-performing items from featured (keep top 50)
+    db.execute("""DELETE FROM featured_portfolio WHERE id NOT IN (
+                    SELECT id FROM featured_portfolio ORDER BY engagement_score DESC LIMIT 50
+                  )""")
+    db.commit()
 
 def _new_token(prefix="sh_"): 
     return prefix + secrets.token_urlsafe(16)
@@ -1684,6 +1854,334 @@ def share_capture_lead():
     
     return jsonify({"ok": True, "message": "Email captured successfully! Check your inbox for exclusive content."})
 
+# --- PORTFOLIO ENDPOINTS ---
+
+@app.route('/portfolio')
+def portfolio_gallery():
+    """Dynamic portfolio gallery with auto-curated featured works"""
+    # Update featured portfolio automatically
+    _update_featured_portfolio()
+    
+    # Get featured works
+    db = get_db()
+    cur = db.execute("""SELECT f.share_token, f.engagement_score, f.seo_title, f.seo_description,
+                               s.title, s.meta_json, s.created_at
+                        FROM featured_portfolio f
+                        JOIN shares s ON f.share_token = s.token
+                        WHERE s.expires_at > ?
+                        ORDER BY f.engagement_score DESC LIMIT 24""",
+                     (datetime.datetime.utcnow().isoformat(),))
+    
+    featured_works = []
+    for row in cur.fetchall():
+        token, score, seo_title, seo_desc, title, meta_json, created_at = row
+        try:
+            meta = json.loads(meta_json or '{}')
+            first_image = meta.get('images', [''])[0] or ''
+            
+            featured_works.append({
+                'token': token,
+                'title': title,
+                'seo_title': seo_title,
+                'seo_description': seo_desc,
+                'image_url': first_image,
+                'engagement_score': score,
+                'created_at': created_at,
+                'prompt': meta.get('positive_prompt', '')[:100] + '...' if meta.get('positive_prompt', '') else '',
+                'platform': meta.get('platform', 'AI Generated')
+            })
+        except:
+            continue
+    
+    html = f"""<!doctype html><html><head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Portfolio - Chaos Venice Productions | Professional AI Art Gallery</title>
+    <meta name="description" content="Explore Chaos Venice Productions' curated portfolio of professional AI-generated artwork. Commission similar works or license existing pieces for commercial use.">
+    <style>
+    body{{font-family:'Inter',system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:linear-gradient(135deg,#0a0e1a 0%,#0f1419 50%,#1a1f2e 100%);color:#e7edf5;margin:0;min-height:100vh}}
+    .wrap{{max-width:1400px;margin:0 auto;padding:20px}}
+    .header{{text-align:center;margin-bottom:50px;padding:40px 20px;background:linear-gradient(45deg,rgba(0,255,255,0.1),rgba(255,0,255,0.1));border-radius:20px;border:1px solid #1f2a3a}}
+    .logo{{font-size:3rem;font-weight:800;background:linear-gradient(45deg,#00ffff,#ff00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:15px}}
+    .tagline{{font-size:1.3rem;color:#9fb2c7;font-style:italic;margin-bottom:10px}}
+    .subtitle{{color:#4f9eff;font-size:1.1rem}}
+    .gallery-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(350px,1fr));gap:30px;margin-top:40px}}
+    .portfolio-item{{background:rgba(17,24,38,0.8);border:1px solid #1f2a3a;border-radius:16px;overflow:hidden;transition:all 0.3s ease;cursor:pointer;position:relative}}
+    .portfolio-item:hover{{transform:translateY(-8px);border-color:#00ffff;box-shadow:0 20px 60px rgba(0,255,255,0.2)}}
+    .item-image{{width:100%;height:250px;object-fit:cover;background:#000}}
+    .item-content{{padding:20px}}
+    .item-title{{font-size:1.1rem;font-weight:600;color:#fff;margin-bottom:8px}}
+    .item-meta{{color:#9fb2c7;font-size:0.9rem;margin-bottom:12px}}
+    .item-prompt{{color:#4f9eff;font-size:0.85rem;margin-bottom:15px;font-style:italic}}
+    .item-actions{{display:flex;gap:10px;flex-wrap:wrap}}
+    .btn{{padding:8px 16px;border-radius:8px;text-decoration:none;font-weight:600;font-size:0.9rem;text-align:center;transition:all 0.2s ease;border:none;cursor:pointer}}
+    .btn-primary{{background:linear-gradient(45deg,#00ffff,#ff00ff);color:#000}}
+    .btn-primary:hover{{transform:scale(1.05)}}
+    .btn-secondary{{background:transparent;border:2px solid #00ffff;color:#00ffff}}
+    .btn-secondary:hover{{background:#00ffff;color:#000}}
+    .engagement-badge{{position:absolute;top:15px;right:15px;background:rgba(0,255,255,0.8);color:#000;padding:4px 8px;border-radius:12px;font-size:0.8rem;font-weight:600}}
+    .stats{{text-align:center;margin:50px 0;padding:30px;background:rgba(17,24,38,0.6);border-radius:16px;border:1px solid #1f2a3a}}
+    .stats h3{{color:#00ffff;margin-bottom:20px}}
+    .stats-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:20px}}
+    .stat-item{{text-align:center}}
+    .stat-number{{font-size:2rem;font-weight:800;background:linear-gradient(45deg,#00ffff,#ff00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}}
+    .stat-label{{color:#9fb2c7;font-size:0.9rem}}
+    @media(max-width:768px){{.gallery-grid{{grid-template-columns:1fr;gap:20px}}.item-actions{{flex-direction:column}}}}
+    </style>
+    </head><body>
+    <div class="wrap">
+      <div class="header">
+        <div class="logo">CHAOS VENICE PRODUCTIONS</div>
+        <div class="tagline">Where Imagination Meets Precision</div>
+        <div class="subtitle">Dynamic Portfolio • Auto-Curated Excellence</div>
+      </div>
+      
+      <div class="stats">
+        <h3>Portfolio Performance</h3>
+        <div class="stats-grid">
+          <div class="stat-item">
+            <div class="stat-number">{len(featured_works)}</div>
+            <div class="stat-label">Featured Works</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-number">{sum(work['engagement_score'] for work in featured_works):.0f}</div>
+            <div class="stat-label">Total Engagement</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-number">24/7</div>
+            <div class="stat-label">Auto-Curation</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-number">AI+Human</div>
+            <div class="stat-label">Hybrid Creation</div>
+          </div>
+        </div>
+      </div>
+      
+      <div class="gallery-grid">"""
+    
+    for work in featured_works:
+        html += f"""
+        <div class="portfolio-item" onclick="viewPortfolioItem('{work['token']}')">
+          <div class="engagement-badge">{work['engagement_score']:.0f}</div>
+          <img src="{work['image_url']}" alt="{work['title']}" class="item-image" loading="lazy">
+          <div class="item-content">
+            <div class="item-title">{work['title']}</div>
+            <div class="item-meta">{work['platform']} • {work['created_at'][:10]}</div>
+            <div class="item-prompt">{work['prompt']}</div>
+            <div class="item-actions">
+              <button class="btn btn-primary" onclick="event.stopPropagation(); orderSimilar('{work['token']}')">Order Similar</button>
+              <button class="btn btn-secondary" onclick="event.stopPropagation(); licenseImage('{work['token']}')">License Image</button>
+            </div>
+          </div>
+        </div>"""
+    
+    html += f"""
+      </div>
+      
+      <div style="text-align:center;margin:60px 0;padding:40px;background:rgba(17,24,38,0.6);border-radius:16px;border:1px solid #1f2a3a">
+        <h3 style="color:#00ffff;margin-bottom:20px">Looking for Something Specific?</h3>
+        <p style="color:#9fb2c7;margin-bottom:30px">Our portfolio updates automatically based on engagement and quality. Can't find what you need?</p>
+        <a href="/contact" class="btn btn-primary" style="display:inline-block;padding:16px 32px;text-decoration:none">Commission Custom Work</a>
+      </div>
+    </div>
+    
+    <script>
+    function viewPortfolioItem(token) {{
+      // Track view
+      fetch('/portfolio/track', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{token: token, action: 'view'}})
+      }});
+      
+      // Open detail page
+      window.open('/portfolio/' + token, '_blank');
+    }}
+    
+    function orderSimilar(token) {{
+      // Track click
+      fetch('/portfolio/track', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{token: token, action: 'click'}})
+      }});
+      
+      // Open order form
+      window.open('/portfolio/' + token + '/order', '_blank');
+    }}
+    
+    function licenseImage(token) {{
+      // Track click
+      fetch('/portfolio/track', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{token: token, action: 'click'}})
+      }});
+      
+      // Open license page
+      window.open('/portfolio/' + token + '/license', '_blank');
+    }}
+    </script>
+    </body></html>"""
+    
+    return Response(html, 200, mimetype="text/html")
+
+@app.route('/portfolio/track', methods=['POST'])
+def track_portfolio_action():
+    """Track portfolio interactions for analytics"""
+    data = request.get_json()
+    token = data.get('token')
+    action = data.get('action', 'view')
+    
+    if token:
+        _track_portfolio_action(token, action)
+    
+    return jsonify({"ok": True})
+
+@app.route('/portfolio/<token>')
+def portfolio_detail(token):
+    """Individual portfolio item detail page with sales CTAs"""
+    db = get_db()
+    
+    # Get share data
+    cur = db.execute("SELECT title, meta_json, created_at FROM shares WHERE token=? AND expires_at > ?",
+                     (token, datetime.datetime.utcnow().isoformat()))
+    share_data = cur.fetchone()
+    
+    if not share_data:
+        return "Portfolio item not found", 404
+    
+    # Track view
+    _track_portfolio_action(token, 'view')
+    
+    title, meta_json, created_at = share_data
+    try:
+        meta = json.loads(meta_json or '{}')
+    except:
+        meta = {}
+    
+    # Get engagement stats
+    score, views, downloads, social_shares = _calculate_engagement_score(token)
+    
+    # Get SEO content
+    seo_title, seo_desc = _generate_seo_content({'title': title, 'meta_json': meta_json})
+    
+    images = meta.get('images', [])
+    prompt = meta.get('positive_prompt', 'Custom AI artwork')
+    negative = meta.get('negative_prompt', '')
+    platform = meta.get('platform', 'AI Generated')
+    
+    html = f"""<!doctype html><html><head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{seo_title}</title>
+    <meta name="description" content="{seo_desc}">
+    <style>
+    body{{font-family:'Inter',system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:linear-gradient(135deg,#0a0e1a 0%,#0f1419 50%,#1a1f2e 100%);color:#e7edf5;margin:0;min-height:100vh}}
+    .wrap{{max-width:1200px;margin:0 auto;padding:20px}}
+    .header{{text-align:center;margin-bottom:40px}}
+    .logo{{font-size:2rem;font-weight:800;background:linear-gradient(45deg,#00ffff,#ff00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}}
+    .content{{display:grid;grid-template-columns:1fr 400px;gap:40px;margin-top:30px}}
+    @media(max-width:1024px){{.content{{grid-template-columns:1fr;gap:30px}}}}
+    .image-section{{}}
+    .main-image{{width:100%;height:auto;border-radius:12px;border:2px solid #1f2a3a}}
+    .image-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px;margin-top:15px}}
+    .thumb{{width:100%;height:80px;object-fit:cover;border-radius:8px;border:1px solid #1f2a3a;cursor:pointer;transition:border-color 0.2s}}
+    .thumb:hover{{border-color:#00ffff}}
+    .details{{background:rgba(17,24,38,0.8);border:1px solid #1f2a3a;border-radius:16px;padding:30px;height:fit-content}}
+    .item-title{{font-size:1.5rem;font-weight:700;color:#fff;margin-bottom:15px}}
+    .meta-item{{margin-bottom:15px;padding-bottom:15px;border-bottom:1px solid #1f2a3a}}
+    .meta-label{{color:#00ffff;font-weight:600;margin-bottom:5px}}
+    .meta-value{{color:#9fb2c7;font-size:0.9rem;word-break:break-word}}
+    .cta-section{{background:linear-gradient(45deg,rgba(0,255,255,0.1),rgba(255,0,255,0.1));padding:25px;border-radius:12px;margin:25px 0}}
+    .cta-title{{color:#fff;font-size:1.2rem;font-weight:600;margin-bottom:15px}}
+    .btn{{display:block;width:100%;padding:15px;margin-bottom:12px;border-radius:8px;text-decoration:none;font-weight:600;text-align:center;transition:all 0.2s ease;border:none;cursor:pointer;font-size:1rem}}
+    .btn-primary{{background:linear-gradient(45deg,#00ffff,#ff00ff);color:#000}}
+    .btn-primary:hover{{transform:scale(1.02)}}
+    .btn-secondary{{background:transparent;border:2px solid #00ffff;color:#00ffff}}
+    .btn-secondary:hover{{background:#00ffff;color:#000}}
+    .stats{{display:grid;grid-template-columns:repeat(2,1fr);gap:15px;margin-top:20px}}
+    .stat{{text-align:center;padding:15px;background:rgba(0,0,0,0.3);border-radius:8px;border:1px solid #1f2a3a}}
+    .stat-number{{font-size:1.5rem;font-weight:700;color:#00ffff}}
+    .stat-label{{color:#9fb2c7;font-size:0.8rem}}
+    </style>
+    </head><body>
+    <div class="wrap">
+      <div class="header">
+        <div class="logo">CHAOS VENICE PRODUCTIONS</div>
+        <a href="/portfolio" style="color:#4f9eff;text-decoration:none">← Back to Portfolio</a>
+      </div>
+      
+      <div class="content">
+        <div class="image-section">
+          <img src="{images[0] if images else ''}" alt="{title}" class="main-image" id="mainImage">
+          <div class="image-grid">"""
+    
+    for i, img in enumerate(images[:8]):
+        html += f'<img src="{img}" alt="{title} {i+1}" class="thumb" onclick="changeMainImage(\'{img}\')">'
+    
+    html += f"""
+          </div>
+        </div>
+        
+        <div class="details">
+          <div class="item-title">{title}</div>
+          
+          <div class="meta-item">
+            <div class="meta-label">Platform</div>
+            <div class="meta-value">{platform}</div>
+          </div>
+          
+          <div class="meta-item">
+            <div class="meta-label">Created</div>
+            <div class="meta-value">{created_at[:10]}</div>
+          </div>
+          
+          <div class="meta-item">
+            <div class="meta-label">Prompt</div>
+            <div class="meta-value">{prompt}</div>
+          </div>
+          
+          {f'<div class="meta-item"><div class="meta-label">Negative Prompt</div><div class="meta-value">{negative}</div></div>' if negative else ''}
+          
+          <div class="cta-section">
+            <div class="cta-title">💎 Get This Style</div>
+            <a href="/portfolio/{token}/order" class="btn btn-primary">Order Similar Artwork</a>
+            <a href="/portfolio/{token}/license" class="btn btn-secondary">License This Image</a>
+          </div>
+          
+          <div class="stats">
+            <div class="stat">
+              <div class="stat-number">{score:.0f}</div>
+              <div class="stat-label">Engagement Score</div>
+            </div>
+            <div class="stat">
+              <div class="stat-number">{views}</div>
+              <div class="stat-label">Views</div>
+            </div>
+            <div class="stat">
+              <div class="stat-number">{downloads}</div>
+              <div class="stat-label">Downloads</div>
+            </div>
+            <div class="stat">
+              <div class="stat-number">{social_shares}</div>
+              <div class="stat-label">Social Shares</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <script>
+    function changeMainImage(src) {{
+      document.getElementById('mainImage').src = src;
+    }}
+    </script>
+    </body></html>"""
+    
+    return Response(html, 200, mimetype="text/html")
+
 @app.route('/contact', methods=['POST'])
 def submit_contact_form():
     """Handle contact form submission and send hire us follow-up email"""
@@ -2239,6 +2737,10 @@ h3{margin:8px 0}select, input[type="text"] {height:40px}textarea {min-height:110
 <div class="container">
   <h1>Universal Prompt Optimizer</h1>
   <p class="sub">Turn rough ideas into model-ready prompts for SDXL, ComfyUI, Midjourney, Pika, and Runway. Built for speed + consistency.</p>
+  <div style="text-align:center;margin:20px 0">
+    <a href="/portfolio" style="background:linear-gradient(45deg,#00ffff,#ff00ff);color:#000;padding:12px 24px;text-decoration:none;border-radius:8px;font-weight:600;margin:0 10px">🎨 View Portfolio</a>
+    <a href="/contact" style="background:transparent;border:2px solid #00ffff;color:#00ffff;padding:10px 22px;text-decoration:none;border-radius:8px;font-weight:600;margin:0 10px">📞 Contact Us</a>
+  </div>
 
   <!-- INPUTS -->
   <div class="card">
@@ -3358,6 +3860,501 @@ def create_zip():
         
     except Exception as e:
         return jsonify({"error": f"ZIP creation failed: {e}"}), 500
+
+# --- PORTFOLIO ORDER AND LICENSE ENDPOINTS ---
+
+@app.route('/portfolio/<token>/order')
+def portfolio_order_form(token):
+    """Order similar artwork form with parameter pre-fill"""
+    db = get_db()
+    
+    # Get share data
+    cur = db.execute("SELECT title, meta_json FROM shares WHERE token=? AND expires_at > ?",
+                     (token, datetime.datetime.utcnow().isoformat()))
+    share_data = cur.fetchone()
+    
+    if not share_data:
+        return "Portfolio item not found", 404
+    
+    # Track order action
+    _track_portfolio_action(token, 'order')
+    
+    title, meta_json = share_data
+    try:
+        meta = json.loads(meta_json or '{}')
+    except:
+        meta = {}
+    
+    image_url = meta.get('images', [''])[0] or ''
+    
+    html = f"""<!doctype html><html><head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Order Similar to {title} - Chaos Venice Productions</title>
+    <style>
+    body{{font-family:'Inter',system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:linear-gradient(135deg,#0a0e1a 0%,#0f1419 50%,#1a1f2e 100%);color:#e7edf5;margin:0;min-height:100vh}}
+    .wrap{{max-width:800px;margin:0 auto;padding:20px}}
+    .header{{text-align:center;margin-bottom:40px;padding:30px;background:linear-gradient(45deg,rgba(0,255,255,0.1),rgba(255,0,255,0.1));border-radius:20px;border:1px solid #1f2a3a}}
+    .logo{{font-size:2.5rem;font-weight:800;background:linear-gradient(45deg,#00ffff,#ff00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:10px}}
+    .tagline{{color:#9fb2c7;font-size:1.1rem}}
+    .reference{{background:rgba(17,24,38,0.8);border:1px solid #1f2a3a;border-radius:16px;padding:20px;margin-bottom:30px}}
+    .ref-image{{width:100%;max-width:300px;height:200px;object-fit:cover;border-radius:8px;border:2px solid #1f2a3a;margin-bottom:15px}}
+    .ref-title{{font-size:1.2rem;font-weight:600;color:#fff;margin-bottom:10px}}
+    .form-section{{background:rgba(17,24,38,0.8);border:1px solid #1f2a3a;border-radius:16px;padding:30px}}
+    .form-group{{margin-bottom:20px}}
+    .label{{display:block;margin-bottom:8px;color:#00ffff;font-weight:600}}
+    .input,.textarea{{width:100%;padding:12px;border:1px solid #1f2a3a;border-radius:8px;background:rgba(0,0,0,0.3);color:#e7edf5;font-size:16px}}
+    .textarea{{resize:vertical;min-height:100px}}
+    .btn{{padding:16px 32px;border-radius:12px;text-decoration:none;font-weight:600;text-align:center;transition:all 0.2s ease;border:none;cursor:pointer;font-size:1rem;width:100%}}
+    .btn-primary{{background:linear-gradient(45deg,#00ffff,#ff00ff);color:#000}}
+    .message{{margin-top:20px;padding:15px;border-radius:8px;display:none;text-align:center}}
+    </style>
+    </head><body>
+    <div class="wrap">
+      <div class="header">
+        <div class="logo">CHAOS VENICE PRODUCTIONS</div>
+        <div class="tagline">Commission Similar Artwork</div>
+      </div>
+      
+      <div class="reference">
+        <h3 style="color:#00ffff;margin-bottom:15px">📸 Reference Artwork</h3>
+        <img src="{image_url}" alt="{title}" class="ref-image">
+        <div class="ref-title">{title}</div>
+      </div>
+      
+      <form id="orderForm" onsubmit="submitOrder(event)" class="form-section">
+        <h3 style="color:#00ffff;margin-bottom:20px">💎 Commission Details</h3>
+        
+        <div class="form-group">
+          <label class="label">Your Name *</label>
+          <input type="text" name="name" required class="input" placeholder="Full name for commission">
+        </div>
+        
+        <div class="form-group">
+          <label class="label">Email Address *</label>
+          <input type="email" name="email" required class="input" placeholder="your@email.com">
+        </div>
+        
+        <div class="form-group">
+          <label class="label">Your Vision & Requirements</label>
+          <textarea name="custom_requirements" class="textarea" placeholder="Describe what you want:&#10;- Subject matter&#10;- Style adjustments&#10;- Size requirements&#10;- Timeline" required></textarea>
+        </div>
+        
+        <div class="form-group">
+          <label class="label">Project Type</label>
+          <select name="project_type" class="input" required>
+            <option value="">Select project type</option>
+            <option value="single_image">Single Custom Image ($299)</option>
+            <option value="image_series">Image Series (3-5 images) ($799)</option>
+            <option value="brand_package">Complete Brand Package ($1,499)</option>
+          </select>
+        </div>
+        
+        <button type="submit" class="btn btn-primary">Submit Commission Request</button>
+        <div id="orderMessage" class="message"></div>
+      </form>
+    </div>
+    
+    <script>
+    function submitOrder(event) {{
+      event.preventDefault();
+      
+      const form = event.target;
+      const formData = new FormData(form);
+      const messageDiv = document.getElementById('orderMessage');
+      const submitBtn = form.querySelector('button[type="submit"]');
+      
+      submitBtn.textContent = 'Submitting...';
+      submitBtn.disabled = true;
+      
+      formData.append('reference_token', '{token}');
+      
+      fetch('/portfolio/{token}/submit-order', {{
+        method: 'POST',
+        body: formData
+      }})
+      .then(response => response.json())
+      .then(data => {{
+        if (data.ok) {{
+          messageDiv.style.display = 'block';
+          messageDiv.style.background = 'rgba(0,255,0,0.1)';
+          messageDiv.style.border = '1px solid #00ff00';
+          messageDiv.style.color = '#00ff00';
+          messageDiv.innerHTML = data.message + '<br><br>You will receive a detailed proposal within 24 hours.';
+          form.reset();
+        }} else {{
+          throw new Error(data.error || 'Unknown error');
+        }}
+      }})
+      .catch(error => {{
+        messageDiv.style.display = 'block';
+        messageDiv.style.background = 'rgba(255,0,0,0.1)';
+        messageDiv.style.border = '1px solid #ff0000';
+        messageDiv.style.color = '#ff0000';
+        messageDiv.textContent = 'Error: ' + error.message;
+      }})
+      .finally(() => {{
+        submitBtn.textContent = 'Submit Commission Request';
+        submitBtn.disabled = false;
+      }});
+    }}
+    </script>
+    </body></html>"""
+    
+    return Response(html, 200, mimetype="text/html")
+
+@app.route('/portfolio/<token>/submit-order', methods=['POST'])
+def submit_portfolio_order():
+    """Process portfolio commission order"""
+    token = request.form.get('reference_token')
+    name = request.form.get('name', '').strip()
+    email = request.form.get('email', '').strip()
+    custom_requirements = request.form.get('custom_requirements', '').strip()
+    project_type = request.form.get('project_type', '')
+    
+    if not all([name, email, custom_requirements, project_type]):
+        return jsonify({"error": "All fields are required"}), 400
+    
+    try:
+        db = get_db()
+        
+        # Create order record
+        order_details = {
+            'name': name,
+            'email': email,
+            'custom_requirements': custom_requirements,
+            'project_type': project_type,
+            'submitted_at': datetime.datetime.utcnow().isoformat()
+        }
+        
+        pricing = {'single_image': 29900, 'image_series': 79900, 'brand_package': 149900}
+        
+        db.execute("""INSERT INTO portfolio_orders(share_token, order_type, customer_email, customer_name, 
+                      order_details, price_cents, created_at)
+                      VALUES(?,?,?,?,?,?,?)""",
+                   (token, 'similar', email, name, json.dumps(order_details),
+                    pricing.get(project_type, 0), datetime.datetime.utcnow().isoformat()))
+        db.commit()
+        
+        # Capture as lead
+        lead_id = _capture_lead(email, token, "portfolio_order")
+        
+        return jsonify({
+            "ok": True, 
+            "message": f"Commission request submitted successfully! Order ID: {token[:8]}"
+        })
+        
+    except Exception as e:
+        _log_error("ERROR", "Portfolio order submission failed", str(e))
+        return jsonify({"error": "Failed to submit order"}), 500
+
+@app.route('/portfolio/<token>/license')
+def portfolio_license_form(token):
+    """License existing image form"""
+    db = get_db()
+    
+    # Get share data
+    cur = db.execute("SELECT title, meta_json FROM shares WHERE token=? AND expires_at > ?",
+                     (token, datetime.datetime.utcnow().isoformat()))
+    share_data = cur.fetchone()
+    
+    if not share_data:
+        return "Portfolio item not found", 404
+    
+    # Track license action
+    _track_portfolio_action(token, 'license')
+    
+    title, meta_json = share_data
+    try:
+        meta = json.loads(meta_json or '{}')
+    except:
+        meta = {}
+    
+    image_url = meta.get('images', [''])[0] or ''
+    
+    html = f"""<!doctype html><html><head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>License {title} - Chaos Venice Productions</title>
+    <style>
+    body{{font-family:'Inter',system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:linear-gradient(135deg,#0a0e1a 0%,#0f1419 50%,#1a1f2e 100%);color:#e7edf5;margin:0;min-height:100vh}}
+    .wrap{{max-width:800px;margin:0 auto;padding:20px}}
+    .header{{text-align:center;margin-bottom:40px;padding:30px;background:linear-gradient(45deg,rgba(0,255,255,0.1),rgba(255,0,255,0.1));border-radius:20px;border:1px solid #1f2a3a}}
+    .logo{{font-size:2.5rem;font-weight:800;background:linear-gradient(45deg,#00ffff,#ff00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:10px}}
+    .image-preview{{text-align:center;margin-bottom:30px}}
+    .license-image{{max-width:100%;height:auto;border-radius:12px;border:2px solid #1f2a3a}}
+    .license-options{{display:grid;gap:20px;margin-bottom:30px}}
+    .license-option{{background:rgba(17,24,38,0.8);border:2px solid #1f2a3a;border-radius:16px;padding:25px;cursor:pointer;transition:all 0.2s ease}}
+    .license-option:hover{{border-color:#00ffff}}
+    .license-option.selected{{border-color:#ff00ff;background:rgba(255,0,255,0.1)}}
+    .license-title{{font-size:1.2rem;font-weight:600;color:#fff;margin-bottom:10px}}
+    .license-price{{font-size:1.8rem;font-weight:800;color:#00ffff;margin-bottom:15px}}
+    .form-section{{background:rgba(17,24,38,0.8);border:1px solid #1f2a3a;border-radius:16px;padding:30px;margin-bottom:20px}}
+    .form-group{{margin-bottom:20px}}
+    .label{{display:block;margin-bottom:8px;color:#00ffff;font-weight:600}}
+    .input{{width:100%;padding:12px;border:1px solid #1f2a3a;border-radius:8px;background:rgba(0,0,0,0.3);color:#e7edf5;font-size:16px}}
+    .btn{{padding:16px 32px;border-radius:12px;text-decoration:none;font-weight:600;text-align:center;transition:all 0.2s ease;border:none;cursor:pointer;font-size:1rem;width:100%}}
+    .btn-primary{{background:linear-gradient(45deg,#00ffff,#ff00ff);color:#000}}
+    .btn-primary:disabled{{opacity:0.6}}
+    .message{{margin-top:20px;padding:15px;border-radius:8px;display:none;text-align:center}}
+    </style>
+    </head><body>
+    <div class="wrap">
+      <div class="header">
+        <div class="logo">CHAOS VENICE PRODUCTIONS</div>
+        <div class="tagline">License High-Quality AI Artwork</div>
+      </div>
+      
+      <div class="image-preview">
+        <img src="{image_url}" alt="{title}" class="license-image">
+        <h3 style="color:#fff;margin-top:20px">{title}</h3>
+      </div>
+      
+      <div class="license-options">
+        <div class="license-option" onclick="selectLicense('personal', 49)">
+          <div class="license-title">Personal Use License</div>
+          <div class="license-price">$49</div>
+          <ul style="color:#9fb2c7">
+            <li>✓ Personal projects and social media</li>
+            <li>✓ High-resolution download</li>
+            <li>✓ Non-commercial use</li>
+          </ul>
+        </div>
+        
+        <div class="license-option" onclick="selectLicense('commercial', 199)">
+          <div class="license-title">Commercial License</div>
+          <div class="license-price">$199</div>
+          <ul style="color:#9fb2c7">
+            <li>✓ Commercial use and resale</li>
+            <li>✓ Marketing and advertising</li>
+            <li>✓ Ultra high-resolution</li>
+          </ul>
+        </div>
+      </div>
+      
+      <form id="licenseForm" onsubmit="submitLicense(event)" class="form-section">
+        <h3 style="color:#00ffff;margin-bottom:20px">📋 License Information</h3>
+        
+        <div class="form-group">
+          <label class="label">Full Name *</label>
+          <input type="text" name="name" required class="input" placeholder="Legal name for license">
+        </div>
+        
+        <div class="form-group">
+          <label class="label">Email Address *</label>
+          <input type="email" name="email" required class="input" placeholder="your@email.com">
+        </div>
+        
+        <div class="form-group">
+          <label class="label">Intended Use Description</label>
+          <input type="text" name="usage" class="input" placeholder="Brief description of how you'll use this image" required>
+        </div>
+        
+        <input type="hidden" name="license_type" id="licenseType" required>
+        <input type="hidden" name="price" id="licensePrice" required>
+        
+        <button type="submit" class="btn btn-primary" id="submitBtn" disabled>Select a License Above</button>
+        <div id="licenseMessage" class="message"></div>
+      </form>
+    </div>
+    
+    <script>
+    let selectedLicense = null;
+    
+    function selectLicense(type, price) {{
+      document.querySelectorAll('.license-option').forEach(el => el.classList.remove('selected'));
+      event.target.closest('.license-option').classList.add('selected');
+      
+      document.getElementById('licenseType').value = type;
+      document.getElementById('licensePrice').value = price;
+      
+      const submitBtn = document.getElementById('submitBtn');
+      submitBtn.disabled = false;
+      submitBtn.textContent = `Purchase ${{price}} License`;
+      
+      selectedLicense = {{type, price}};
+    }}
+    
+    function submitLicense(event) {{
+      event.preventDefault();
+      
+      const form = event.target;
+      const formData = new FormData(form);
+      const messageDiv = document.getElementById('licenseMessage');
+      const submitBtn = document.getElementById('submitBtn');
+      
+      submitBtn.textContent = 'Processing...';
+      submitBtn.disabled = true;
+      
+      formData.append('reference_token', '{token}');
+      
+      fetch('/portfolio/{token}/submit-license', {{
+        method: 'POST',
+        body: formData
+      }})
+      .then(response => response.json())
+      .then(data => {{
+        if (data.ok) {{
+          messageDiv.style.display = 'block';
+          messageDiv.style.background = 'rgba(0,255,0,0.1)';
+          messageDiv.style.border = '1px solid #00ff00';
+          messageDiv.style.color = '#00ff00';
+          messageDiv.innerHTML = data.message + '<br><br>You will receive payment instructions within 2 hours.';
+          form.reset();
+        }} else {{
+          throw new Error(data.error || 'Unknown error');
+        }}
+      }})
+      .catch(error => {{
+        messageDiv.style.display = 'block';
+        messageDiv.style.background = 'rgba(255,0,0,0.1)';
+        messageDiv.style.border = '1px solid #ff0000';
+        messageDiv.style.color = '#ff0000';
+        messageDiv.textContent = 'Error: ' + error.message;
+      }})
+      .finally(() => {{
+        if (selectedLicense) {{
+          submitBtn.textContent = `Purchase ${{selectedLicense.price}} License`;
+          submitBtn.disabled = false;
+        }}
+      }});
+    }}
+    </script>
+    </body></html>"""
+    
+    return Response(html, 200, mimetype="text/html")
+
+@app.route('/portfolio/<token>/submit-license', methods=['POST'])
+def submit_portfolio_license():
+    """Process portfolio image licensing"""
+    token = request.form.get('reference_token')
+    name = request.form.get('name', '').strip()
+    email = request.form.get('email', '').strip()
+    usage = request.form.get('usage', '').strip()
+    license_type = request.form.get('license_type', '')
+    price = request.form.get('price', '')
+    
+    if not all([name, email, usage, license_type, price]):
+        return jsonify({"error": "All required fields must be completed"}), 400
+    
+    try:
+        db = get_db()
+        
+        # Create license order record
+        order_details = {
+            'name': name,
+            'email': email,
+            'usage': usage,
+            'license_type': license_type,
+            'price_dollars': int(price),
+            'submitted_at': datetime.datetime.utcnow().isoformat()
+        }
+        
+        db.execute("""INSERT INTO portfolio_orders(share_token, order_type, customer_email, customer_name, 
+                      order_details, price_cents, created_at)
+                      VALUES(?,?,?,?,?,?,?)""",
+                   (token, 'license', email, name, json.dumps(order_details),
+                    int(price) * 100, datetime.datetime.utcnow().isoformat()))
+        db.commit()
+        
+        # Capture as lead
+        lead_id = _capture_lead(email, token, "portfolio_license")
+        
+        return jsonify({
+            "ok": True, 
+            "message": f"License order submitted successfully! Order ID: {token[:8]}"
+        })
+        
+    except Exception as e:
+        _log_error("ERROR", "Portfolio license submission failed", str(e))
+        return jsonify({"error": "Failed to submit license order"}), 500
+
+# --- PORTFOLIO ADMIN ENDPOINTS ---
+
+@app.route('/admin/portfolio-orders')
+def admin_portfolio_orders():
+    """Admin view of all portfolio orders"""
+    admin_token = request.args.get('admin_token')
+    expected_token = os.environ.get('ADMIN_TOKEN', 'admin123')
+    
+    if admin_token != expected_token:
+        return "Unauthorized", 401
+    
+    db = get_db()
+    cur = db.execute("""SELECT o.*, s.title FROM portfolio_orders o
+                        LEFT JOIN shares s ON o.share_token = s.token
+                        ORDER BY o.created_at DESC""")
+    
+    orders = []
+    for row in cur.fetchall():
+        try:
+            details = json.loads(row[5] or '{}')
+            orders.append({
+                'id': row[0],
+                'token': row[1],
+                'type': row[2],
+                'email': row[3],
+                'name': row[4],
+                'details': details,
+                'price': row[6] / 100 if row[6] else 0,
+                'status': row[7],
+                'created_at': row[8],
+                'title': row[9] or 'Unknown'
+            })
+        except:
+            continue
+    
+    html = f"""<!doctype html><html><head>
+    <meta charset="utf-8">
+    <title>Portfolio Orders - Admin</title>
+    <style>
+    body{{font-family:system-ui;background:#0b0f14;color:#e7edf5;margin:0;padding:20px}}
+    .container{{max-width:1200px;margin:0 auto}}
+    table{{width:100%;border-collapse:collapse;background:#111826;border-radius:8px;overflow:hidden}}
+    th,td{{padding:12px;text-align:left;border-bottom:1px solid #1f2a3a}}
+    th{{background:#1f2a3a;font-weight:600}}
+    .order-type{{padding:4px 8px;border-radius:4px;font-size:12px;font-weight:600}}
+    .type-similar{{background:#2563eb;color:white}}
+    .type-license{{background:#059669;color:white}}
+    .status{{padding:4px 8px;border-radius:4px;font-size:12px}}
+    .status-pending{{background:#f59e0b;color:black}}
+    .details{{max-width:300px;font-size:12px;color:#9fb2c7}}
+    </style>
+    </head><body>
+    <div class="container">
+      <h1>Portfolio Orders ({len(orders)})</h1>
+      <table>
+        <tr>
+          <th>ID</th>
+          <th>Type</th>
+          <th>Customer</th>
+          <th>Portfolio Item</th>
+          <th>Price</th>
+          <th>Status</th>
+          <th>Details</th>
+          <th>Date</th>
+        </tr>"""
+    
+    for order in orders:
+        order_type_class = f"type-{order['type']}"
+        html += f"""
+        <tr>
+          <td>{order['id']}</td>
+          <td><span class="order-type {order_type_class}">{order['type'].title()}</span></td>
+          <td>{order['name']}<br><small>{order['email']}</small></td>
+          <td>{order['title']}<br><small>{order['token'][:8]}...</small></td>
+          <td>${order['price']:.2f}</td>
+          <td><span class="status status-{order['status']}">{order['status'].title()}</span></td>
+          <td class="details">{str(order['details']).replace('{', '').replace('}', '')[:100]}...</td>
+          <td>{order['created_at'][:16]}</td>
+        </tr>"""
+    
+    html += """
+      </table>
+    </div>
+    </body></html>"""
+    
+    return Response(html, 200, mimetype="text/html")
 
 # Create demo key on startup
 bootstrap_demo_key()

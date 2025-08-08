@@ -1,0 +1,81 @@
+Agent Task:
+Build Dynamic Portfolio Engine + Auto-Sell Flow for Chaos Venice Productions
+
+Goal:
+Transform Chaos Venice’s public portfolio into a fully automated sales funnel that updates in real time with our best, most engaging creative works. Every portfolio piece must have a direct path to purchase or commission without manual intervention.
+
+Core Features
+Automatic Content Curation
+
+Monitor all new generations from authenticated users in real time.
+
+Filter for top-performing images based on:
+
+Highest engagement on share pages.
+
+Most ZIP downloads.
+
+Most social shares.
+
+Push these automatically into a public “Featured Works” section.
+
+Dynamic Portfolio Pages
+
+Cinematic grid layout with hover previews.
+
+Each image opens a detail page showing:
+
+Parameters used.
+
+Platform (SDXL, ComfyUI, etc.).
+
+“Order Similar” button (pre-fills contact form with the parameters).
+
+“License This Image” button with instant payment checkout.
+
+Auto-generated SEO titles & descriptions for every new piece.
+
+Sales-Optimized CTAs
+
+“Order Similar” → Contact form with image preview & parameter lock.
+
+“Commission a Project” → Payment page with tiered options.
+
+Add upsell suggestion for higher-end packages.
+
+Lead & Sale Tracking
+
+Every click on an image → tracked in SQLite.
+
+Every order → instantly emailed to orders@chaosvenice.com with customer info.
+
+Admin panel to view portfolio stats: views, clicks, conversions.
+
+Email Integration
+
+Featured Works section updated daily → triggers “Portfolio Update” email to all captured leads.
+
+Emails are branded and cinematic, highlighting 3–5 new works with direct order links.
+
+Technical Requirements
+Pulls from the existing SQLite DB used by Universal Prompt Optimizer.
+
+Uses same branding/theme as share pages (dark + teal/magenta neon).
+
+Optimized for speed — image thumbnails served via CDN or compressed preview.
+
+Secure endpoints for managing what’s “featured” (manual override possible).
+
+Works seamlessly on desktop & mobile.
+
+Acceptance Criteria:
+
+No manual upload — all featured portfolio updates happen automatically based on engagement.
+
+Every portfolio item has direct revenue action (order/license).
+
+Portfolio changes trigger branded email updates automatically.
+
+Admin can see which works bring in the most orders.
+
+Once complete, this will ensure every generated asset is a passive sales tool that feeds Chaos Venice Productions’ revenue stream without manual effort.
