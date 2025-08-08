@@ -1,0 +1,215 @@
+1) Create/replace these files
+.replit
+ini
+Copy
+Edit
+run = "pip install -r requirements.txt && gunicorn -c gunicorn.conf.py app:app"
+language = "python"
+entrypoint = "app.py"
+gunicorn.conf.py
+python
+Copy
+Edit
+import os
+
+bind = f"0.0.0.0:{os.environ.get('PORT', '8000')}"
+workers = 1            # single worker so the scheduler runs ONCE
+worker_class = "gthread"
+threads = 16
+timeout = 120
+graceful_timeout = 30
+keepalive = 5
+
+accesslog = "-"
+errorlog = "-"
+loglevel = "info"
+requirements.txt (append if you already have one)
+shell
+Copy
+Edit
+flask>=3.0
+gunicorn>=22.0
+itsdangerous>=2.2
+requests>=2.32
+python-dotenv>=1.0
+sendgrid>=6.11
+apscheduler>=3.10
+sqlalchemy>=2.0
+jinja2>=3.1
+2) Open app.py and paste this block after you create app = Flask(__name__) and after your DB init
+If you see create_app() factory, paste inside it after extensions/DB are initialized, before return app.
+
+python
+Copy
+Edit
+# ===== Scheduler bootstrap (safe, idempotent) =====
+import os, atexit, logging, datetime as dt
+from flask import jsonify
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+
+log = logging.getLogger(__name__)
+_scheduler = None
+
+def _maybe_call(name):
+    """Call an internal function if it exists; return (ok, message)."""
+    fn = globals().get(name)
+    if callable(fn):
+        try:
+            fn()
+            return True, f"called {name}"
+        except Exception as e:
+            log.exception("Error running %s: %s", name, e)
+            return False, f"error in {name}: {e}"
+    return False, f"missing {name}"
+
+def _job_process_upsell_emails():
+    # Replace internal names if yours differ
+    for candidate in ("_internal_process_upsell_emails", "process_upsell_emails"):
+        ok, msg = _maybe_call(candidate)
+        if ok or "error" in msg:
+            return
+    log.info("No upsell email processor found; skipping.")
+
+def _job_process_email_retries():
+    for candidate in ("_internal_process_email_retries", "process_email_retries"):
+        ok, msg = _maybe_call(candidate)
+        if ok or "error" in msg:
+            return
+    log.info("No email retry processor found; skipping.")
+
+def _job_cleanup_expired_sessions():
+    for candidate in ("_internal_cleanup_expired_sessions", "cleanup_expired_sessions"):
+        ok, msg = _maybe_call(candidate)
+        if ok or "error" in msg:
+            return
+    log.info("No cleanup function found; skipping.")
+
+def _start_background_scheduler():
+    """Start once; skip if DISABLE_SCHEDULER=1."""
+    global _scheduler
+    if os.environ.get("DISABLE_SCHEDULER") == "1":
+        log.warning("Scheduler disabled via DISABLE_SCHEDULER=1")
+        return None
+    if _scheduler is not None:
+        return _scheduler
+
+    _scheduler = BackgroundScheduler(timezone="UTC", daemon=True)
+    # Tick intervals — adjust if you want them tighter/looser
+    _scheduler.add_job(
+        func=_job_process_upsell_emails,
+        trigger=IntervalTrigger(minutes=15),
+        id="process_upsell_emails",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
+    )
+    _scheduler.add_job(
+        func=_job_process_email_retries,
+        trigger=IntervalTrigger(minutes=10),
+        id="process_email_retries",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
+    )
+    _scheduler.add_job(
+        func=_job_cleanup_expired_sessions,
+        trigger=IntervalTrigger(hours=1),
+        id="cleanup_expired_sessions",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=120,
+    )
+
+    _scheduler.start()
+    atexit.register(lambda: _scheduler.shutdown(wait=False))
+    log.info("BackgroundScheduler started with jobs: %s", [j.id for j in _scheduler.get_jobs()])
+    return _scheduler
+
+# start it now (Gunicorn worker boot)
+_start_background_scheduler()
+
+# ---- Health & Admin sanity routes ----
+@app.get("/health")
+def health():
+    return {"status": "ok"}, 200
+
+@app.get("/admin/system")
+def admin_system():
+    jobs = []
+    try:
+        if _scheduler:
+            for j in _scheduler.get_jobs():
+                jobs.append({
+                    "id": j.id,
+                    "next_run_time": j.next_run_time.isoformat() if j.next_run_time else None
+                })
+    except Exception as e:
+        jobs = [{"error": str(e)}]
+    return jsonify({
+        "ok": True,
+        "utc_time": dt.datetime.utcnow().isoformat(),
+        "scheduler_on": _scheduler is not None,
+        "jobs": jobs
+    }), 200
+
+# Optional: manual triggers for testing (no DB writes, just call internals if present)
+@app.post("/admin/run/upsell")
+def admin_run_upsell():
+    _job_process_upsell_emails()
+    return {"ok": True}, 200
+
+@app.post("/admin/run/retries")
+def admin_run_retries():
+    _job_process_email_retries()
+    return {"ok": True}, 200
+
+@app.post("/admin/run/cleanup")
+def admin_run_cleanup():
+    _job_cleanup_expired_sessions()
+    return {"ok": True}, 200
+# ===== end scheduler block =====
+If your internal function names are different, add them to each candidate tuple above. If none exist, nothing breaks—jobs just log and skip.
+
+3) Replit secrets (set these)
+SENDGRID_API_KEY (real one; for dry-run tests you can add SENDGRID_SANDBOX=1 and honor it in your send code)
+
+FROM_EMAIL=hello@chaosvenice.com
+
+Any OAuth secrets you use
+
+Optional kill switches: DISABLE_SCHEDULER=1, EMAILS_DISABLED=1
+
+4) Run + verify (2 minutes)
+Click Run in Replit.
+
+Console should show Gunicorn starting (1 worker) and:
+BackgroundScheduler started with jobs: ['process_upsell_emails','process_email_retries','cleanup_expired_sessions']
+
+Visit /health → expect {"status":"ok"}.
+
+Visit /admin/system → expect scheduler_on: true and 3 jobs with next_run_time.
+
+(Optional) Trigger jobs now:
+
+POST /admin/run/upsell
+
+POST /admin/run/retries
+
+POST /admin/run/cleanup
+Watch logs; no tracebacks = good.
+
+That’s it. If anything throws, paste the exact error line and I’ll patch immediately.
+
+
+
+
+
+
+
+
+
+Ask ChatGPT

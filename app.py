@@ -266,19 +266,56 @@ def _init_share_table():
         
         db.commit()
 
-# --- SCHEDULER SETUP ---
+# ===== Scheduler bootstrap (safe, idempotent) =====
+log = logging.getLogger(__name__)
+
+def _maybe_call(name):
+    """Call an internal function if it exists; return (ok, message)."""
+    fn = globals().get(name)
+    if callable(fn):
+        try:
+            fn()
+            return True, f"called {name}"
+        except Exception as e:
+            log.exception("Error running %s: %s", name, e)
+            return False, f"error in {name}: {e}"
+    return False, f"missing {name}"
+
+def _job_process_upsell_emails():
+    # Replace internal names if yours differ
+    for candidate in ("scheduled_process_upsell_emails", "_internal_process_upsell_emails", "process_upsell_emails"):
+        ok, msg = _maybe_call(candidate)
+        if ok or "error" in msg:
+            return
+    log.info("No upsell email processor found; skipping.")
+
+def _job_process_email_retries():
+    for candidate in ("scheduled_process_email_retries", "_internal_process_email_retries", "process_email_retries"):
+        ok, msg = _maybe_call(candidate)
+        if ok or "error" in msg:
+            return
+    log.info("No email retry processor found; skipping.")
+
+def _job_cleanup_expired_sessions():
+    for candidate in ("scheduled_cleanup_expired_sessions", "_internal_cleanup_expired_sessions", "cleanup_expired_sessions"):
+        ok, msg = _maybe_call(candidate)
+        if ok or "error" in msg:
+            return
+    log.info("No cleanup function found; skipping.")
 
 def _start_background_scheduler():
+    """Start once; skip if DISABLE_SCHEDULER=1."""
     global _scheduler
-    # Avoid double-starts (reloader / hot runs)
+    if os.environ.get("DISABLE_SCHEDULER") == "1":
+        log.warning("Scheduler disabled via DISABLE_SCHEDULER=1")
+        return None
     if _scheduler is not None:
         return _scheduler
-    _scheduler = BackgroundScheduler(timezone="UTC", daemon=True)
 
-    # === JOBS ===
-    # 1) Process upsell email steps (every 15 minutes)
+    _scheduler = BackgroundScheduler(timezone="UTC", daemon=True)
+    # Tick intervals — adjust if you want them tighter/looser
     _scheduler.add_job(
-        func=scheduled_process_upsell_emails,
+        func=_job_process_upsell_emails,
         trigger=IntervalTrigger(minutes=15),
         id="process_upsell_emails",
         replace_existing=True,
@@ -286,10 +323,8 @@ def _start_background_scheduler():
         coalesce=True,
         misfire_grace_time=60,
     )
-
-    # 2) Retry failed transactional emails (every 10 minutes)
     _scheduler.add_job(
-        func=scheduled_process_email_retries,
+        func=_job_process_email_retries,
         trigger=IntervalTrigger(minutes=10),
         id="process_email_retries",
         replace_existing=True,
@@ -297,10 +332,8 @@ def _start_background_scheduler():
         coalesce=True,
         misfire_grace_time=60,
     )
-
-    # 3) Cleanup expired sessions / stale tokens (every hour)
     _scheduler.add_job(
-        func=scheduled_cleanup_expired_sessions,
+        func=_job_cleanup_expired_sessions,
         trigger=IntervalTrigger(hours=1),
         id="cleanup_expired_sessions",
         replace_existing=True,
@@ -311,7 +344,7 @@ def _start_background_scheduler():
 
     _scheduler.start()
     atexit.register(lambda: _scheduler.shutdown(wait=False))
-    logger.info("BackgroundScheduler started with 3 jobs.")
+    log.info("BackgroundScheduler started with jobs: %s", [j.id for j in _scheduler.get_jobs()])
     return _scheduler
 
 def scheduled_process_upsell_emails():
@@ -463,7 +496,7 @@ def scheduled_cleanup_expired_sessions():
     except Exception as e:
         logger.exception("scheduled_cleanup_expired_sessions error: %s", e)
 
-# Start the scheduler
+# start it now (Gunicorn worker boot)
 _start_background_scheduler()
 
 # --- PORTFOLIO ENGINE FUNCTIONS ---
@@ -5291,28 +5324,45 @@ def admin_process_emails():
         _log_error("ERROR", "Manual email processing failed", str(e))
         return jsonify({"error": "Failed to process emails"}), 500
 
-@app.route('/admin/system')
+# ---- Health & Admin sanity routes ----
+@app.get("/health")
+def health():
+    return {"status": "ok"}, 200
+
+@app.get("/admin/system")
 def admin_system():
-    """Health check and scheduler status endpoint"""
     jobs = []
     try:
         if _scheduler:
             for j in _scheduler.get_jobs():
                 jobs.append({
                     "id": j.id,
-                    "next_run_time": j.next_run_time.isoformat() if j.next_run_time else None,
-                    "func": j.func.__name__ if j.func else None
+                    "next_run_time": j.next_run_time.isoformat() if j.next_run_time else None
                 })
     except Exception as e:
         jobs = [{"error": str(e)}]
-
     return jsonify({
         "ok": True,
         "utc_time": datetime.datetime.utcnow().isoformat(),
-        "scheduler_running": _scheduler is not None and _scheduler.running,
-        "scheduler_jobs": jobs,
-        "total_jobs": len(jobs)
+        "scheduler_on": _scheduler is not None,
+        "jobs": jobs
     }), 200
+
+# Optional: manual triggers for testing (no DB writes, just call internals if present)
+@app.post("/admin/run/upsell")
+def admin_run_upsell():
+    _job_process_upsell_emails()
+    return {"ok": True}, 200
+
+@app.post("/admin/run/retries")
+def admin_run_retries():
+    _job_process_email_retries()
+    return {"ok": True}, 200
+
+@app.post("/admin/run/cleanup")
+def admin_run_cleanup():
+    _job_cleanup_expired_sessions()
+    return {"ok": True}, 200
 
 @app.route('/admin/portfolio-orders')
 def admin_portfolio_orders():
