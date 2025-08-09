@@ -1,266 +1,273 @@
 # prompt_engine.py
-# Lightweight prompt reasoning + expansion + platform presets
-# No external dependencies.
+# Clean, safe, phrase-preserving prompt builder with platform presets.
+# Returns a dict with: primary, negative, meta, platforms{sdxl,comfyui,midjourney,pika,runway}
 
-from typing import Dict, Any, List
+from __future__ import annotations
 import re
+from typing import Dict, Any, List
 
-# ---------------------------
-# Content-safety guardrails
-# ---------------------------
 
-DISALLOWED_PATTERNS = [
-    r"\b(sexual|rape|molest|incest|bestiality)\b",
+# ---------- basic cleaners ----------
+
+def _clean_space(s: str) -> str:
+    s = (s or "").replace("\n", " ").strip()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"\s+,", ",", s)
+    s = re.sub(r",\s*,", ", ", s)
+    return s
+
+def _clamp_words(s: str, max_words: int = 160) -> str:
+    parts = s.split()
+    if len(parts) > max_words:
+        parts = parts[:max_words]
+    return " ".join(parts)
+
+
+# ---------- safety (reject or soften) ----------
+
+# Disallow sexual violence & minors. We will block these.
+DISALLOW = [
     r"\b(non[- ]?consensual|against\s+their\s+will)\b",
+    r"\b(rape|molest|incest|bestiality)\b",
     r"\b(minor|underage|child)\b.*\b(nude|sexual|explicit)\b",
+    r"\b(sexual)\b.*\b(violence|assault)\b",
 ]
 
-def is_disallowed(text: str) -> bool:
-    t = text.lower()
-    for pat in DISALLOWED_PATTERNS:
-        if re.search(pat, t):
+# We also block explicit violence combined with sex words
+SEX_WORD = r"\b(sex|nsfw|porn|explicit|nude|nudity)\b"
+VIOLENT_WORD = r"\b(drown|kill|murder|stab|shoot|maim|behead|strangle)\b"
+
+def _is_blocked(idea: str) -> bool:
+    t = idea.lower()
+    if re.search(SEX_WORD, t) and re.search(VIOLENT_WORD, t):
+        return True
+    for pat in DISALLOW:
+        if re.search(pat, t, re.I):
             return True
     return False
 
+# Soft de-escalation for plain violence (no sexual component)
+SOFTEN_MAP = {
+    r"\bdrown(s|ed|ing)?\b": "overpower (off-screen, implied)",
+    r"\bkill(s|ed|ing)?\b": "neutralize (off-screen, implied)",
+    r"\bstab(s|bed|bing)?\b": "threaten (off-screen)",
+    r"\bshoot(s|ing)?\b": "aim (off-screen)",
+    r"\bblood(y)?\b": "splashing water",
+}
+def _soften(text: str) -> str:
+    out = text
+    for pat, repl in SOFTEN_MAP.items():
+        out = re.sub(pat, repl, out, flags=re.I)
+    return out
 
-# ---------------------------
-# Heuristic “reasoning” helpers
-# ---------------------------
 
-QUALITY_TAGS = [
-    "award-winning", "highly detailed", "intricate", "8k", "sharp focus",
-    "global illumination", "photorealistic", "studio quality"
+# ---------- light “reasoning” to extract cues ----------
+
+QUALITY = [
+    "highly detailed", "sharp focus", "global illumination",
+    "professional grade", "8k detail"
 ]
 
-# Default negative prompt that’s generally safe across image/video models
-BASE_NEGATIVE = [
-    "blurry", "soft focus", "lowres", "low quality", "jpeg artifacts",
-    "overexposed", "underexposed", "bad anatomy", "extra limbs",
-    "mutated hands", "missing fingers", "crooked eyes", "poorly drawn hands",
-    "deformed", "duplicate", "tiling", "frame out of subject"
-]
-
-# Style keywords we’ll collect (if user hints at them) to tighten the output
 STYLE_HINTS = {
-    "cinematic": ["cinematic lighting", "film still", "shallow depth of field"],
-    "moody": ["moody lighting", "desaturated", "high contrast"],
-    "neon": ["neon lighting", "specular highlights", "vibrant glow"],
-    "analog": ["kodak portra 400", "35mm", "grain"],
-    "portrait": ["bokeh", "85mm lens", "studio lighting"],
-    "fantasy": ["epic fantasy", "volumetric light", "concept art"]
+    "cinematic": ["cinematic lighting", "film still realism", "shallow depth of field"],
+    "portrait": ["85mm lens", "bokeh", "studio lighting"],
+    "neon": ["neon reflections", "vibrant glow"],
+    "analog": ["kodak portra 400", "35mm", "natural grain"],
+    "moody": ["dramatic contrast", "desaturated palette"],
+    "fantasy": ["epic fantasy", "volumetric light", "concept art"],
 }
 
+SUBJECT_VOCAB = {
+    "woman","women","man","men","person","people","couple","model","athlete",
+    "character","warrior","mage","robot","android","cat","dog","chef","artist",
+}
+ACTION_VOCAB = {
+    "walking","running","arguing","confronting","dancing","posing","smiling",
+    "holding","reading","cooking","flying","swimming","sitting","standing",
+    "looking","staring","working","training","meditating",
+}
+SETTING_VOCAB = {
+    "forest","desert","city","street","alley","rooftop","studio","beach",
+    "mountain","cafe","kitchen","classroom","arena","hot","tub","rain","snow",
+    "night","sunset","dawn","neon","cyberpunk","scifi",
+}
 
-def extract_subjects_actions_setting(idea: str) -> Dict[str, List[str]]:
-    """
-    Very light NLP: pull out potential subjects, actions, and a setting cue.
-    We avoid heavy libs to keep this deploy-friendly.
-    """
-    text = " " + idea.lower() + " "
-    # crude tokenization
-    tokens = re.findall(r"[a-zA-Z\-']{2,}", text)
-
-    subjects = []
-    actions = []
-    setting = []
-
-    # Naive vocab buckets
-    subject_vocab = {
-        "woman", "women", "man", "men", "person", "people",
-        "girl", "boy", "couple", "lesbian", "lesbians",
-        "robot", "android", "warrior", "mage", "creature", "dragon",
-        "cat", "dog", "character", "model", "athlete", "chef"
-    }
-
-    action_vocab = {
-        "walking", "running", "fighting", "arguing", "embracing", "dancing",
-        "posing", "smiling", "holding", "reading", "cooking", "flying",
-        "swimming", "sitting", "standing", "looking", "staring", "confronting",
-        "driving", "working", "training", "meditating"
-    }
-
-    setting_vocab = {
-        "forest", "desert", "city", "street", "alley", "rooftop", "studio",
-        "beach", "mountain", "cafe", "kitchen", "classroom", "arena", "hot", "tub",
-        "rain", "snow", "night", "sunset", "dawn", "neon", "cyberpunk", "scifi"
-    }
-
+def _extract_cues(idea: str) -> Dict[str, List[str]]:
+    tokens = re.findall(r"[a-zA-Z\-']{2,}", idea.lower())
+    subs, acts, sets_ = [], [], []
     for t in tokens:
-        if t in subject_vocab and t not in subjects:
-            subjects.append(t)
-        if t in action_vocab and t not in actions:
-            actions.append(t)
-        if t in setting_vocab and t not in setting:
-            setting.append(t)
+        if t in SUBJECT_VOCAB and t not in subs: subs.append(t)
+        if t in ACTION_VOCAB and t not in acts: acts.append(t)
+        if t in SETTING_VOCAB and t not in sets_: sets_.append(t)
+    # phrase repair: "hot tub"
+    if "hot" in sets_ and "tub" in sets_:
+        sets_ = [s for s in sets_ if s not in ("hot","tub")]
+        sets_.insert(0, "hot tub")
+    return {"subjects": subs[:4], "actions": acts[:4], "setting": sets_[:6]}
 
-    return {"subjects": subjects[:4], "actions": actions[:4], "setting": setting[:6]}
-
-
-def collect_style_hints(idea: str) -> List[str]:
-    text = idea.lower()
-    out = []
+def _style_from_idea(idea: str) -> List[str]:
+    t = idea.lower()
+    out: List[str] = []
     for key, vals in STYLE_HINTS.items():
-        if key in text:
+        if key in t:
             out.extend(vals)
     return out
 
 
-def build_positive_prompt(idea: str) -> str:
-    # Extract cues
-    cues = extract_subjects_actions_setting(idea)
-    style = collect_style_hints(idea)
+# ---------- positive/negative builders ----------
 
-    # Compose a clear subject line
-    subjects = cues["subjects"] or ["subject"]
-    actions = cues["actions"]
-    setting = cues["setting"]
+BASE_NEG = [
+    "blurry","soft focus","lowres","low quality","jpeg artifacts",
+    "overexposed","underexposed","bad anatomy","extra limbs",
+    "mutated hands","missing fingers","crooked eyes","poorly drawn hands",
+    "deformed","duplicate","tiling","frame out of subject","watermark","text","logo"
+]
 
-    # Clean up “hot tub” as two-word phrase if detected
-    if "hot" in setting and "tub" in setting:
-        setting = [s for s in setting if s not in ("hot", "tub")]
-        setting.insert(0, "hot tub")
+def _build_positive(idea: str) -> str:
+    cues = _extract_cues(idea)
+    styles = _style_from_idea(idea)
 
-    # Always push toward neutral, non-violent depiction if fighting/arguing shows up
-    # Replace with “tense confrontation” to avoid explicit violence
-    action_phrase = ""
-    if actions:
-        safe_actions = []
-        for a in actions:
-            if a in ("fighting", "arguing", "confronting"):
-                safe_actions.append("tense confrontation")
-            else:
-                safe_actions.append(a)
-        action_phrase = ", ".join(sorted(set(safe_actions)))
+    subjects = ", ".join(sorted(set(cues["subjects"]))) or "subject"
+    actions = []
+    for a in cues["actions"]:
+        if a in ("arguing","confronting"):
+            actions.append("tense confrontation")
+        else:
+            actions.append(a)
+    action_phrase = ", ".join(sorted(set(actions)))
+    setting_phrase = ", ".join(sorted(set(cues["setting"])))
 
-    subject_phrase = ", ".join(sorted(set(subjects)))
-    setting_phrase = ", ".join(sorted(set(setting))) if setting else ""
+    composition = ["rule of thirds","clean composition"]
+    parts: List[str] = [subjects]
+    if action_phrase: parts.append(action_phrase)
+    if setting_phrase: parts.append(setting_phrase)
+    parts += QUALITY + composition + styles
 
-    # Quality & composition tags
-    composition = [
-        "rule of thirds", "subject centered", "clean composition"
-    ]
-
-    positive_parts = [
-        subject_phrase,
-        action_phrase if action_phrase else "",
-        setting_phrase,
-        *QUALITY_TAGS,
-        *composition,
-        *style
-    ]
-
-    # Collapse, remove empties, dedup while keeping order
-    seen = set()
-    final = []
-    for p in positive_parts:
-        p = p.strip(",;: ").strip()
-        if not p:
-            continue
-        if p not in seen:
-            final.append(p)
-            seen.add(p)
-
+    # dedup while preserving order
+    seen, final = set(), []
+    for p in parts:
+        p = p.strip(",;: ")
+        if p and p not in seen:
+            final.append(p); seen.add(p)
     return ", ".join(final)
 
-
-def build_negative_prompt(idea: str) -> str:
-    # Base negatives
-    negatives = list(BASE_NEGATIVE)
-
-    # If user mentions “violent”/“gore”, hard-block gorey artifacts
+def _build_negative(idea: str) -> str:
+    neg = list(BASE_NEG)
     if re.search(r"\b(blood|gore|splatter|dismember)\b", idea.lower()):
-        negatives.extend(["blood", "gore", "splatter", "wound", "injury"])
-
-    # De-duplicate and join
-    neg = []
-    seen = set()
-    for n in negatives:
-        n = n.strip()
-        if n and n not in seen:
-            neg.append(n)
-            seen.add(n)
-    return ", ".join(neg)
+        neg += ["blood","gore","splatter","wound","injury"]
+    # dedup
+    out, seen = [], set()
+    for n in neg:
+        if n not in seen:
+            out.append(n); seen.add(n)
+    return ", ".join(out)
 
 
-# ---------------------------
-# Platform presets
-# ---------------------------
+# ---------- platform presets ----------
 
-PLATFORM_PRESETS = {
+PRESETS = {
     "sdxl":  {"width": 1024, "height": 1024, "steps": 30, "cfg": 6.5, "sampler": "DPM++ 2M Karras"},
-    "comfy": {"width": 1024, "height": 1024, "steps": 30, "cfg": 6.5, "sampler": "dpmpp_2m"},
-    "mjv6":  {"aspect": "1:1", "quality": "high"},
+    "comfyui":{"width": 1024, "height": 1024, "steps": 30, "cfg": 6.5, "sampler": "dpmpp_2m_karras"},
+    "midjourney": {"flags": "--v 6 --style raw --chaos 0 --ar 1:1"},
     "pika":  {"duration": 4, "motion": "subtle", "camera": "static"},
-    "runway":{"duration": 4, "motion": "subtle", "camera": "static"}
+    "runway":{"duration": 4, "motion": "subtle", "camera": "static"},
 }
 
 
-# ---------------------------
-# Public API
-# ---------------------------
+# ---------- public API: build_prompt ----------
 
-def optimize_prompt(
+def build_prompt(
     idea: str,
+    style: str = "cinematic",
     platform: str = "sdxl",
-    extras: Dict[str, Any] | None = None
+    safe_mode: str = "soften",
+    extra_tags: str = "",
 ) -> Dict[str, Any]:
     """
-    Takes a raw idea and returns a structured result:
-      {
-        'platform': 'sdxl',
-        'positive': '...',
-        'negative': '...',
-        'params': { ... platform defaults ... },
-        'notes': '...'
-      }
-    Raises a friendly error in 'notes' if content is disallowed.
+    Returns:
+    {
+      "primary": str,
+      "negative": str,
+      "meta": {...},
+      "platforms": { "sdxl": {...}, "comfyui": {...}, "midjourney": {...}, "pika": {...}, "runway": {...} }
+    }
     """
-    extras = extras or {}
+    raw = _clean_space(idea)
+    if not raw:
+        return {"primary": "", "negative": "", "meta": {"error": "empty idea"}, "platforms": {}}
 
-    if is_disallowed(idea):
+    # hard block sexual violence / minors
+    if _is_blocked(raw):
         return {
-            "platform": platform,
-            "positive": "",
+            "primary": "",
             "negative": "",
-            "params": {},
-            "notes": (
-                "The idea appears to include disallowed content (e.g., sexual violence). "
-                "Please rewrite your prompt to avoid sexual or non-consensual scenarios."
-            )
+            "meta": {
+                "error": "Blocked: sexual violence or minors with explicit content.",
+                "safe_mode": "strict"
+            },
+            "platforms": {}
         }
 
-    positive = build_positive_prompt(idea)
-    negative = build_negative_prompt(idea)
+    # gentle de-escalation for plain violence if requested
+    text = _soften(raw) if safe_mode in ("soften","strict") else raw
+    text = _clean_space(_clamp_words(text))
 
-    # Merge platform defaults
-    preset = PLATFORM_PRESETS.get(platform.lower(), PLATFORM_PRESETS["sdxl"]).copy()
-    preset.update(extras or {})
+    positive = _build_positive(text)
+    if extra_tags:
+        positive = f"{positive}, { _clean_space(extra_tags) }"
+    negative = _build_negative(text)
 
-    notes = "Optimized with light reasoning, quality tags, style hints, and safety filtering."
+    # cross-platform payloads
+    platforms: Dict[str, Any] = {}
 
-    return {
-        "platform": platform.lower(),
-        "positive": positive,
+    # SDXL
+    p = PRESETS["sdxl"]
+    platforms["sdxl"] = {
+        "prompt": positive,
         "negative": negative,
-        "params": preset,
-        "notes": notes
+        "width": p["width"], "height": p["height"],
+        "sampler": p["sampler"], "steps": p["steps"], "cfg": p["cfg"], "seed": "random"
     }
 
+    # ComfyUI (compatible fields)
+    c = PRESETS["comfyui"]
+    platforms["comfyui"] = {
+        "positive": positive,
+        "negative": negative,
+        "width": c["width"], "height": c["height"],
+        "sampler": c["sampler"], "steps": c["steps"], "cfg": c["cfg"]
+    }
 
-# Quick local test (optional):
-if __name__ == "__main__":
-    tests = [
-        "Two women in a hot tub arguing at night, cinematic, neon",
-        "A warrior reading a book in a forest at dawn, fantasy, cinematic",
-    ]
-    for t in tests:
-        out = optimize_prompt(t, platform="sdxl")
-        print("\nIDEA:", t)
-        print("POS:", out["positive"])
-        print("NEG:", out["negative"])
-        print("PAR:", out["params"])
-        print("NOTES:", out["notes"])
+    # Midjourney
+    mj_flags = PRESETS["midjourney"]["flags"]
+    platforms["midjourney"] = {
+        "prompt": f"{positive} {mj_flags}",
+        "negative": negative
+    }
 
-        "dimensions": pr["dimensions"],
-        }
-    return pack
+    # Pika
+    pk = PRESETS["pika"]
+    platforms["pika"] = {
+        "prompt": positive, "avoid": negative,
+        "duration": pk["duration"], "motion": pk["motion"], "camera": pk["camera"]
+    }
+
+    # Runway
+    rw = PRESETS["runway"]
+    platforms["runway"] = {
+        "prompt": positive, "negative_prompt": negative,
+        "duration": rw["duration"], "motion": rw["motion"], "camera": rw["camera"]
+    }
+
+    meta = {
+        "style": style,
+        "safe_mode": safe_mode,
+        "note": "Phrase-preserving optimization with quality tags, composition, and platform presets."
+    }
+
+    return {
+        "primary": positive,
+        "negative": negative,
+        "meta": meta,
+        "platforms": platforms
+    }
