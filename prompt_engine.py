@@ -261,6 +261,6 @@ if __name__ == "__main__":
         print("PAR:", out["params"])
         print("NOTES:", out["notes"])
 
-            "dimensions": pr["dimensions"],
+        "dimensions": pr["dimensions"],
         }
     return pack
