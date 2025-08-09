@@ -3925,10 +3925,6 @@ def optimize():
     except Exception as e:
         return jsonify({"error": f"Server error: {e}"}), 500
 
-@app.route("/api/optimize", methods=["POST"])
-def api_optimize():
-    return optimize()
-
 # Map pretty sampler names to ComfyUI short names
 _SAMPLER_MAP = {
     "DPM++ 2M Karras": "dpmpp_2m", "DPM++ 2M": "dpmpp_2m",
