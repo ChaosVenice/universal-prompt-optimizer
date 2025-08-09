@@ -1,273 +1,383 @@
 # prompt_engine.py
-# Clean, safe, phrase-preserving prompt builder with platform presets.
-# Returns a dict with: primary, negative, meta, platforms{sdxl,comfyui,midjourney,pika,runway}
+# Drop-in upgrade for build_prompt(pr)
+# No external deps; deterministic, platform-aware prompt packaging.
 
-from __future__ import annotations
-import re
-from typing import Dict, Any, List
+from typing import Dict, Tuple, List
 
+# ---- Style presets tuned for cross-model consistency ----
+STYLE_PRESETS = {
+    "cinematic": [
+        "cinematic lighting", "rich contrast", "depth of field", "35mm film look",
+        "color graded", "high dynamic range"
+    ],
+    "photorealistic": [
+        "photorealistic", "physically based rendering", "global illumination",
+        "volumetric light", "realistic textures", "natural skin tones"
+    ],
+    "anime": [
+        "anime style", "clean line art", "cel shading", "studio-quality coloring",
+        "expressive eyes", "dynamic composition"
+    ],
+    "illustration": [
+        "illustration", "inked linework", "vibrant colors", "hand-drawn feel",
+        "storybook composition"
+    ],
+    "3d render": [
+        "ultra-detailed 3D render", "ray tracing", "subsurface scattering",
+        "high poly", "octane-style lighting"
+    ],
+    "pixel art": [
+        "pixel art", "limited palette", "crisp 1px outlines", "retro aesthetic",
+        "NES/SNES-era styling"
+    ],
+    "watercolor": [
+        "watercolor painting", "soft washes", "paper texture", "pigment bloom",
+        "loose brushwork"
+    ],
+    "line art": [
+        "monoline", "clean contour lines", "minimal shading", "vector style"
+    ],
+}
 
-# ---------- basic cleaners ----------
+# ---- Baseline negative prompts by platform (safe defaults) ----
+NEGATIVE_BASE = {
+    "sdxl": [
+        "low quality", "blurry", "jpeg artifacts", "overexposed", "underexposed",
+        "extra limbs", "bad anatomy", "mutated hands", "deformed"
+    ],
+    "comfyui": [
+        "lowres", "noise", "bad composition", "posterization", "oversharpened",
+        "extra limbs", "bad anatomy", "deformed"
+    ],
+    "midjourney": [
+        "blurry", "low detail", "mutated", "disfigured", "extra limbs", "bad anatomy",
+        "watermark", "text"
+    ],
+    "pika": [
+        "low quality", "motion smear", "jitter", "banding", "flicker", "bad anatomy"
+    ],
+    "runway": [
+        "low quality", "blurry", "banding", "posterization", "artifacting", "bad anatomy"
+    ],
+}
 
-def _clean_space(s: str) -> str:
-    s = (s or "").replace("\n", " ").strip()
-    s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"\s+,", ",", s)
-    s = re.sub(r",\s*,", ", ", s)
-    return s
-
-def _clamp_words(s: str, max_words: int = 160) -> str:
-    parts = s.split()
-    if len(parts) > max_words:
-        parts = parts[:max_words]
-    return " ".join(parts)
-
-
-# ---------- safety (reject or soften) ----------
-
-# Disallow sexual violence & minors. We will block these.
-DISALLOW = [
-    r"\b(non[- ]?consensual|against\s+their\s+will)\b",
-    r"\b(rape|molest|incest|bestiality)\b",
-    r"\b(minor|underage|child)\b.*\b(nude|sexual|explicit)\b",
-    r"\b(sexual)\b.*\b(violence|assault)\b",
+# Terms we’ll strip when safe_mode=True (beyond your app-level hard block)
+SOFT_FILTER = [
+    "nudity", "explicit", "nsfw", "porn", "sexual", "erotic", "fetish",
 ]
 
-# We also block explicit violence combined with sex words
-SEX_WORD = r"\b(sex|nsfw|porn|explicit|nude|nudity)\b"
-VIOLENT_WORD = r"\b(drown|kill|murder|stab|shoot|maim|behead|strangle)\b"
+# Samplers are hints for SDXL/ComfyUI packs (clients can ignore)
+SUGGESTED_SAMPLERS = ["DPM++ 2M Karras", "Euler a", "DDIM"]
 
-def _is_blocked(idea: str) -> bool:
-    t = idea.lower()
-    if re.search(SEX_WORD, t) and re.search(VIOLENT_WORD, t):
-        return True
-    for pat in DISALLOW:
-        if re.search(pat, t, re.I):
-            return True
-    return False
+def _clamp(v: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, v))
 
-# Soft de-escalation for plain violence (no sexual component)
-SOFTEN_MAP = {
-    r"\bdrown(s|ed|ing)?\b": "overpower (off-screen, implied)",
-    r"\bkill(s|ed|ing)?\b": "neutralize (off-screen, implied)",
-    r"\bstab(s|bed|bing)?\b": "threaten (off-screen)",
-    r"\bshoot(s|ing)?\b": "aim (off-screen)",
-    r"\bblood(y)?\b": "splashing water",
-}
-def _soften(text: str) -> str:
-    out = text
-    for pat, repl in SOFTEN_MAP.items():
-        out = re.sub(pat, repl, out, flags=re.I)
-    return out
+def _parse_aspect(aspect: str) -> Tuple[int, int, str]:
+    """
+    Normalize aspect to a width/height pair and canonical string.
+    Targets reasonable defaults compatible with most backends.
+    We keep the smaller side <= 1024 by default to avoid OOM in common hosts.
+    """
+    a = (aspect or "16:9").strip().lower().replace(" ", "")
+    if "x" in a and ":" not in a:
+        # handle "1920x1080" style quickly
+        try:
+            w, h = [int(x) for x in a.split("x")]
+            if w > 0 and h > 0:
+                return w, h, f"{w}:{h}"
+        except Exception:
+            pass
+    if ":" not in a:
+        # fallback to common labels
+        presets = {
+            "square": (1024, 1024, "1:1"),
+            "portrait": (896, 1152, "7:9"),
+            "landscape": (1344, 768, "21:12"),
+        }
+        return presets.get(a, (1344, 768, "16:9"))
 
-
-# ---------- light “reasoning” to extract cues ----------
-
-QUALITY = [
-    "highly detailed", "sharp focus", "global illumination",
-    "professional grade", "8k detail"
-]
-
-STYLE_HINTS = {
-    "cinematic": ["cinematic lighting", "film still realism", "shallow depth of field"],
-    "portrait": ["85mm lens", "bokeh", "studio lighting"],
-    "neon": ["neon reflections", "vibrant glow"],
-    "analog": ["kodak portra 400", "35mm", "natural grain"],
-    "moody": ["dramatic contrast", "desaturated palette"],
-    "fantasy": ["epic fantasy", "volumetric light", "concept art"],
-}
-
-SUBJECT_VOCAB = {
-    "woman","women","man","men","person","people","couple","model","athlete",
-    "character","warrior","mage","robot","android","cat","dog","chef","artist",
-}
-ACTION_VOCAB = {
-    "walking","running","arguing","confronting","dancing","posing","smiling",
-    "holding","reading","cooking","flying","swimming","sitting","standing",
-    "looking","staring","working","training","meditating",
-}
-SETTING_VOCAB = {
-    "forest","desert","city","street","alley","rooftop","studio","beach",
-    "mountain","cafe","kitchen","classroom","arena","hot","tub","rain","snow",
-    "night","sunset","dawn","neon","cyberpunk","scifi",
-}
-
-def _extract_cues(idea: str) -> Dict[str, List[str]]:
-    tokens = re.findall(r"[a-zA-Z\-']{2,}", idea.lower())
-    subs, acts, sets_ = [], [], []
-    for t in tokens:
-        if t in SUBJECT_VOCAB and t not in subs: subs.append(t)
-        if t in ACTION_VOCAB and t not in acts: acts.append(t)
-        if t in SETTING_VOCAB and t not in sets_: sets_.append(t)
-    # phrase repair: "hot tub"
-    if "hot" in sets_ and "tub" in sets_:
-        sets_ = [s for s in sets_ if s not in ("hot","tub")]
-        sets_.insert(0, "hot tub")
-    return {"subjects": subs[:4], "actions": acts[:4], "setting": sets_[:6]}
-
-def _style_from_idea(idea: str) -> List[str]:
-    t = idea.lower()
-    out: List[str] = []
-    for key, vals in STYLE_HINTS.items():
-        if key in t:
-            out.extend(vals)
-    return out
-
-
-# ---------- positive/negative builders ----------
-
-BASE_NEG = [
-    "blurry","soft focus","lowres","low quality","jpeg artifacts",
-    "overexposed","underexposed","bad anatomy","extra limbs",
-    "mutated hands","missing fingers","crooked eyes","poorly drawn hands",
-    "deformed","duplicate","tiling","frame out of subject","watermark","text","logo"
-]
-
-def _build_positive(idea: str) -> str:
-    cues = _extract_cues(idea)
-    styles = _style_from_idea(idea)
-
-    subjects = ", ".join(sorted(set(cues["subjects"]))) or "subject"
-    actions = []
-    for a in cues["actions"]:
-        if a in ("arguing","confronting"):
-            actions.append("tense confrontation")
+    try:
+        num, den = a.split(":")
+        num = float(num); den = float(den)
+        if num <= 0 or den <= 0:
+            raise ValueError
+        ratio = num / den
+        # pick the smaller side at 1024, scale the other
+        base = 1024
+        if ratio >= 1.0:
+            h = base
+            w = int(round(base * ratio))
         else:
-            actions.append(a)
-    action_phrase = ", ".join(sorted(set(actions)))
-    setting_phrase = ", ".join(sorted(set(cues["setting"])))
+            w = base
+            h = int(round(base / ratio))
+        # round to multiples of 64 (nice for many models)
+        def round64(x): 
+            return int(round(x / 64.0) * 64)
+        w, h = round64(w), round64(h)
+        return w, h, f"{int(num)}:{int(den)}"
+    except Exception:
+        return 1344, 768, "16:9"
 
-    composition = ["rule of thirds","clean composition"]
-    parts: List[str] = [subjects]
-    if action_phrase: parts.append(action_phrase)
-    if setting_phrase: parts.append(setting_phrase)
-    parts += QUALITY + composition + styles
+def _expand_style(style: str) -> List[str]:
+    s = (style or "").strip().lower()
+    if not s:
+        return []
+    # allow comma-separated mixtures, map each token via STYLE_PRESETS if known
+    tokens = [t.strip() for t in s.split(",") if t.strip()]
+    out: List[str] = []
+    for t in tokens:
+        if t in STYLE_PRESETS:
+            out.extend(STYLE_PRESETS[t])
+        else:
+            # unknown style: pass through as-is (keeps flexibility)
+            out.append(t)
+    return out
 
-    # dedup while preserving order
-    seen, final = set(), []
-    for p in parts:
-        p = p.strip(",;: ")
-        if p and p not in seen:
-            final.append(p); seen.add(p)
-    return ", ".join(final)
+def _tag_list(extra_tags: str) -> List[str]:
+    if not extra_tags:
+        return []
+    tags = [t.strip() for t in extra_tags.split(",")]
+    return [t for t in tags if t]
 
-def _build_negative(idea: str) -> str:
-    neg = list(BASE_NEG)
-    if re.search(r"\b(blood|gore|splatter|dismember)\b", idea.lower()):
-        neg += ["blood","gore","splatter","wound","injury"]
-    # dedup
-    out, seen = [], set()
-    for n in neg:
-        if n not in seen:
-            out.append(n); seen.add(n)
-    return ", ".join(out)
+def _apply_safe_mode(text: str, enabled: bool) -> str:
+    if not enabled:
+        return text
+    lowered = text.lower()
+    for term in SOFT_FILTER:
+        if term in lowered:
+            # crude remove: replace whole word variants
+            text = _soft_remove(text, term)
+    return text
 
+def _soft_remove(text: str, term: str) -> str:
+    # minimal non-regex removal to avoid adding deps
+    repls = [
+        term, term.title(), term.upper()
+    ]
+    for r in repls:
+        text = text.replace(r, "")
+    return " ".join(text.split())
 
-# ---------- platform presets ----------
-
-PRESETS = {
-    "sdxl":  {"width": 1024, "height": 1024, "steps": 30, "cfg": 6.5, "sampler": "DPM++ 2M Karras"},
-    "comfyui":{"width": 1024, "height": 1024, "steps": 30, "cfg": 6.5, "sampler": "dpmpp_2m_karras"},
-    "midjourney": {"flags": "--v 6 --style raw --chaos 0 --ar 1:1"},
-    "pika":  {"duration": 4, "motion": "subtle", "camera": "static"},
-    "runway":{"duration": 4, "motion": "subtle", "camera": "static"},
-}
-
-
-# ---------- public API: build_prompt ----------
-
-def build_prompt(
-    idea: str,
-    style: str = "cinematic",
-    platform: str = "sdxl",
-    safe_mode: str = "soften",
-    extra_tags: str = "",
-) -> Dict[str, Any]:
+def _complexity_boosters(level: int) -> List[str]:
     """
-    Returns:
-    {
-      "primary": str,
-      "negative": str,
-      "meta": {...},
-      "platforms": { "sdxl": {...}, "comfyui": {...}, "midjourney": {...}, "pika": {...}, "runway": {...} }
+    Adds composition/lighting/texture cues as complexity rises (1..5).
+    We keep these neutral so they don't hijack user intent.
+    """
+    level = _clamp(level, 1, 5)
+    tiers = {
+        1: ["clean composition"],
+        2: ["balanced composition", "clear subject separation"],
+        3: ["dynamic composition", "subtle rim lighting", "material detail"],
+        4: ["advanced composition", "cinematic volumetrics", "micro-surface detail"],
+        5: ["masterful composition", "complex lighting", "intricate texture fidelity"],
     }
-    """
-    raw = _clean_space(idea)
-    if not raw:
-        return {"primary": "", "negative": "", "meta": {"error": "empty idea"}, "platforms": {}}
+    return tiers[level]
 
-    # hard block sexual violence / minors
-    if _is_blocked(raw):
+def _quality_params(score: int) -> Dict[str, int]:
+    """
+    Translate 0..100 quality to steps/cfg hints that most backends can map.
+    """
+    score = _clamp(score, 0, 100)
+    # steps: 12..42, cfg: 3..9
+    steps = int(round(12 + (score / 100.0) * (42 - 12)))
+    cfg = int(round(3 + (score / 100.0) * (9 - 3)))
+    return {"steps": steps, "cfg": cfg}
+
+def _build_positive(idea: str,
+                    style_tokens: List[str],
+                    tags: List[str],
+                    complexity: int,
+                    safe_mode: bool) -> str:
+    # Preserve user intent first
+    base = idea.strip()
+    # Apply safe mode soft filter
+    base = _apply_safe_mode(base, safe_mode)
+    # Expand with neutral complexity hints and style/tags
+    pieces = [base]
+    boosters = _complexity_boosters(complexity)
+    if boosters:
+        pieces.append(", ".join(boosters))
+    if style_tokens:
+        pieces.append(", ".join(style_tokens))
+    if tags:
+        pieces.append(", ".join(tags))
+    # Join cleanly
+    positive = ", ".join([p for p in pieces if p])
+    # Compact stray commas/spaces
+    return " ".join(positive.replace(" ,", ",").split())
+
+def _merge_negative(platform: str, user_negative: str, safe_mode: bool) -> str:
+    base = NEGATIVE_BASE.get(platform, [])
+    user = (user_negative or "").strip()
+    if user:
+        base = base + [user]
+    neg = ", ".join(base)
+    return _apply_safe_mode(neg, safe_mode)
+
+def _platform_pack(platform: str,
+                   positive: str,
+                   negative: str,
+                   width: int,
+                   height: int,
+                   quality: int,
+                   complexity: int) -> Dict:
+    qp = _quality_params(quality)
+    steps = qp["steps"]
+    cfg = qp["cfg"]
+
+    if platform == "midjourney":
+        # Map to common MJ flags (avoid version pin)
+        # Stylize ~ quality; Chaos ~ complexity
+        stylize = int(round(50 + (quality / 100.0) * 750))   # ~50..800
+        chaos = int(round((complexity - 1) * 10))            # 0..40
+        ar = _mj_aspect_flag(width, height)
+        mj_prompt = f"{positive} --ar {ar} --stylize {stylize} --chaos {chaos}"
         return {
-            "primary": "",
-            "negative": "",
-            "meta": {
-                "error": "Blocked: sexual violence or minors with explicit content.",
-                "safe_mode": "strict"
-            },
-            "platforms": {}
+            "platform": "midjourney",
+            "prompt": mj_prompt,
+            "negative_hint": negative,   # MJ lacks true negative; kept as hint
+            "params": {"stylize": stylize, "chaos": chaos, "aspect": ar}
         }
 
-    # gentle de-escalation for plain violence if requested
-    text = _soften(raw) if safe_mode in ("soften","strict") else raw
-    text = _clean_space(_clamp_words(text))
+    if platform == "comfyui":
+        # Provide a ready set of node input hints; clients can wire in their graph
+        return {
+            "platform": "comfyui",
+            "inputs": {
+                "positive": positive,
+                "negative": negative,
+                "width": width,
+                "height": height,
+                "cfg": cfg,
+                "steps": steps,
+                "sampler_name": SUGGESTED_SAMPLERS[0],
+            }
+        }
 
-    positive = _build_positive(text)
-    if extra_tags:
-        positive = f"{positive}, { _clean_space(extra_tags) }"
-    negative = _build_negative(text)
+    if platform == "pika":
+        # Text-to-video style hints (Pika interprets text + internal params)
+        duration_hint = 4 + (complexity - 1)  # 4..8s suggestion
+        return {
+            "platform": "pika",
+            "text_prompt": positive,
+            "negative_prompt": negative,
+            "params": {
+                "width": width,
+                "height": height,
+                "guidance": cfg,
+                "steps": steps,
+                "duration_seconds_hint": duration_hint
+            }
+        }
 
-    # cross-platform payloads
-    platforms: Dict[str, Any] = {}
+    if platform == "runway":
+        # Runway Gen features map loosely: we pass sane hints
+        return {
+            "platform": "runway",
+            "text_prompt": positive,
+            "negative_prompt": negative,
+            "params": {
+                "width": width,
+                "height": height,
+                "guidance": cfg,
+                "steps": steps
+            }
+        }
 
-    # SDXL
-    p = PRESETS["sdxl"]
-    platforms["sdxl"] = {
-        "prompt": positive,
-        "negative": negative,
-        "width": p["width"], "height": p["height"],
-        "sampler": p["sampler"], "steps": p["steps"], "cfg": p["cfg"], "seed": "random"
-    }
-
-    # ComfyUI (compatible fields)
-    c = PRESETS["comfyui"]
-    platforms["comfyui"] = {
+    # Default SDXL pack
+    return {
+        "platform": "sdxl",
         "positive": positive,
         "negative": negative,
-        "width": c["width"], "height": c["height"],
-        "sampler": c["sampler"], "steps": c["steps"], "cfg": c["cfg"]
+        "params": {
+            "width": width,
+            "height": height,
+            "cfg": cfg,
+            "steps": steps,
+            "sampler": SUGGESTED_SAMPLERS[0],
+        }
     }
 
-    # Midjourney
-    mj_flags = PRESETS["midjourney"]["flags"]
-    platforms["midjourney"] = {
-        "prompt": f"{positive} {mj_flags}",
-        "negative": negative
-    }
+def _mj_aspect_flag(w: int, h: int) -> str:
+    # Reduce ratio to simplest common string "W:H"
+    from math import gcd
+    g = gcd(w, h)
+    return f"{w//g}:{h//g}"
 
-    # Pika
-    pk = PRESETS["pika"]
-    platforms["pika"] = {
-        "prompt": positive, "avoid": negative,
-        "duration": pk["duration"], "motion": pk["motion"], "camera": pk["camera"]
-    }
+# ---- Public API ----
+def build_prompt(pr: Dict) -> Dict:
+    """
+    Input (from app.py):
+      {
+        "idea": str,
+        "platform": "sdxl"|"comfyui"|"midjourney"|"pika"|"runway",
+        "style": str,
+        "aspect": str,             # e.g. "16:9", "1:1", "portrait", "1920x1080"
+        "extra_tags": str,         # comma-separated
+        "negative": str,
+        "safe_mode": bool,
+        "complexity": int,         # 1..5
+        "quality": int,            # 0..100
+      }
+    Returns a stable pack with minimal required top-level keys preserved
+    to avoid breaking clients: 'platform', 'prompt' (or 'positive'), 'negative'.
+    Extra platform-specific fields are namespaced.
+    """
+    platform = (pr.get("platform") or "sdxl").lower()
+    if platform not in {"sdxl", "comfyui", "midjourney", "pika", "runway"}:
+        platform = "sdxl"
 
-    # Runway
-    rw = PRESETS["runway"]
-    platforms["runway"] = {
-        "prompt": positive, "negative_prompt": negative,
-        "duration": rw["duration"], "motion": rw["motion"], "camera": rw["camera"]
-    }
+    idea = (pr.get("idea") or "").strip()
+    style = (pr.get("style") or "").strip()
+    extra_tags = (pr.get("extra_tags") or "").strip()
+    negative_in = (pr.get("negative") or "").strip()
+    safe_mode = bool(pr.get("safe_mode", True))
+    complexity = int(pr.get("complexity", 3))
+    quality = int(pr.get("quality", 70))
 
-    meta = {
-        "style": style,
+    # Aspect -> numeric dims + canonical string
+    width, height, canonical_ar = _parse_aspect(pr.get("aspect") or "16:9")
+
+    # Build positive
+    style_tokens = _expand_style(style)
+    tags = _tag_list(extra_tags)
+    positive = _build_positive(idea, style_tokens, tags, complexity, safe_mode)
+
+    # Merge negative
+    negative = _merge_negative(platform, negative_in, safe_mode)
+
+    # Platform-specific packaging
+    pack_specific = _platform_pack(platform, positive, negative, width, height, quality, complexity)
+
+    # Top-level, conservative keys to avoid breaking existing simple clients
+    # - If platform is MJ we expose 'prompt'; SDXL/ComfyUI expose 'positive'.
+    out: Dict = {
+        "platform": platform,
+        "idea": idea,
+        "aspect": canonical_ar,
+        "width": width,
+        "height": height,
+        "quality": _clamp(quality, 0, 100),
+        "complexity": _clamp(complexity, 1, 5),
         "safe_mode": safe_mode,
-        "note": "Phrase-preserving optimization with quality tags, composition, and platform presets."
+        "style": style,
+        "tags": tags,
     }
 
-    return {
-        "primary": positive,
-        "negative": negative,
-        "meta": meta,
-        "platforms": platforms
-    }
+    # Flatten a couple of common fields for easy consumption
+    if platform == "midjourney":
+        out["prompt"] = pack_specific["prompt"]
+        out["negative"] = pack_specific.get("negative_hint", "")
+    elif platform in {"pika", "runway"}:
+        out["prompt"] = pack_specific["text_prompt"]
+        out["negative"] = pack_specific.get("negative_prompt", "")
+    else:
+        # sdxl / comfyui
+        out["positive"] = positive
+        out["prompt"] = positive  # alias for compatibility
+        out["negative"] = negative
+
+    # Namespaced detailed pack for power users
+    out["platform_pack"] = pack_specific
+
+    return out
