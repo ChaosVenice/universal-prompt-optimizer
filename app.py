@@ -34,6 +34,8 @@ app.config['JSON_SORT_KEYS'] = False  # Preserve JSON key order for better cachi
 # Memory-based response cache for frequently accessed data
 from functools import lru_cache
 import hashlib
+from prompt_engine import build_prompt
+
 
 # Create a simple cache decorator for expensive operations
 def cache_response(maxsize=128):
@@ -5457,6 +5459,35 @@ def admin_portfolio_orders():
     """Admin view of all portfolio orders"""
     admin_token = request.args.get('admin_token')
     expected_token = os.environ.get('ADMIN_TOKEN', 'admin123')
+
+@app.post("/api/optimize")
+def api_optimize():
+    data = request.get_json(force=True) or {}
+    idea = (data.get("idea") or data.get("input") or "").strip()
+    platform = (data.get("platform") or "sdxl").lower()
+    style = data.get("style") or "cinematic"
+    safe_mode = data.get("safe_mode") or "soften"
+    extra_tags = data.get("extra_tags") or ""
+
+    if not idea:
+        return jsonify({"error": "Missing 'idea'"}), 400
+
+    pack = build_prompt(
+        idea=idea,
+        style=style,
+        platform=platform,
+        safe_mode=safe_mode,
+        extra_tags=extra_tags,
+    )
+
+    return jsonify({
+        "idea": idea,
+        "primary": pack["primary"],
+        "negative": pack["negative"],
+        "meta": pack["meta"],
+        "platforms": pack["platforms"],
+    }), 200
+
     
     if admin_token != expected_token:
         return "Unauthorized", 401
