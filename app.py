@@ -5459,30 +5459,66 @@ def admin_portfolio_orders():
 @app.post("/api/optimize")
 def api_optimize():
     data = request.get_json(force=True) or {}
-    idea = (data.get("idea") or data.get("input") or "").strip()
-    platform = (data.get("platform") or "sdxl").lower()
-    style = data.get("style") or "cinematic"
-    safe_mode = data.get("safe_mode") or "soften"
-    extra_tags = data.get("extra_tags") or ""
 
+    # Accept both "idea" and legacy "input"
+    idea = (data.get("idea") or data.get("input") or "").strip()
     if not idea:
         return jsonify({"error": "Missing 'idea'"}), 400
 
-    pack = build_prompt(
-        idea=idea,
-        style=style,
-        platform=platform,
-        safe_mode=safe_mode,
-        extra_tags=extra_tags,
-    )
+    # Normalize options with sensible defaults
+    platform = (data.get("platform") or "").lower()
+    if platform not in {"sdxl", "comfyui", "midjourney", "pika", "runway"}:
+        platform = "sdxl"
 
-    return jsonify({
+    aspect = str(data.get("aspect") or data.get("aspect_ratio") or "16:9")
+    style = (data.get("style") or data.get("vibe") or "").strip()
+    extra_tags = (data.get("extra_tags") or data.get("tags") or "").strip()
+    negative = (data.get("negative") or data.get("negative_prompt") or "").strip()
+
+    # Controls
+    safe_mode = bool(data.get("safe_mode", True))
+    # 1–5, where 3 = balanced
+    try:
+        complexity = int(data.get("complexity", 3))
+    except Exception:
+        complexity = 3
+    complexity = max(1, min(5, complexity))
+
+    # 0–100 quality boost (used by prompt_engine heuristics)
+    try:
+        quality = int(data.get("quality", 70))
+    except Exception:
+        quality = 70
+    quality = max(0, min(100, quality))
+
+    # Lightweight safety guard (server-side)
+    unsafe_terms = [
+        "sexual violence", "rape", "child", "bestiality", "gore", "snuff",
+        "murder", "kill", "dismember", "torture"
+    ]
+    lower_idea = idea.lower()
+    if any(term in lower_idea for term in unsafe_terms):
+        return jsonify({
+            "error": "This prompt includes unsafe content. Please rephrase to remove explicit violence or sexual harm."
+        }), 400
+
+    # Build request for the prompt engine
+    pr = {
         "idea": idea,
-        "primary": pack["primary"],
-        "negative": pack["negative"],
-        "meta": pack["meta"],
-        "platforms": pack["platforms"],
-    }), 200
+        "platform": platform,
+        "style": style,
+        "aspect": aspect,
+        "extra_tags": extra_tags,
+        "negative": negative,
+        "safe_mode": safe_mode,
+        "complexity": complexity,
+        "quality": quality,
+    }
+
+    # Delegate to prompt_engine for platform-specific optimization
+    pack = build_prompt(pr)
+    return jsonify(pack), 200
+
 
     
     if admin_token != expected_token:
