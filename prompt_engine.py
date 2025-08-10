@@ -1,6 +1,5 @@
 # prompt_engine.py
-# Drop-in upgrade for build_prompt(pr)
-# No external deps; deterministic, platform-aware prompt packaging.
+# Deterministic, platform-aware prompt packaging for /api/optimize
 
 from typing import Dict, Tuple, List
 
@@ -61,38 +60,24 @@ NEGATIVE_BASE = {
     ],
 }
 
-# Terms we’ll strip when safe_mode=True (beyond your app-level hard block)
-SOFT_FILTER = [
-    "nudity", "explicit", "nsfw", "porn", "sexual", "erotic", "fetish",
-]
+# Terms stripped when safe_mode=True (in addition to app-level hard block)
+SOFT_FILTER = ["nudity", "explicit", "nsfw", "porn", "sexual", "erotic", "fetish"]
 
-# Samplers are hints for SDXL/ComfyUI packs (clients can ignore)
+# Sampler hints (clients may ignore)
 SUGGESTED_SAMPLERS = ["DPM++ 2M Karras", "Euler a", "DDIM"]
 
+
+# ---------- helpers ----------
 def _clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
 
 def _parse_aspect(aspect: str) -> Tuple[int, int, str]:
     """
-    Normalize aspect to a width/height pair and canonical string.
-    We keep the smaller side <= 1024 by default and round dims to /64.
+    Normalize aspect to width/height pair and canonical 'W:H' string.
+    Smaller side ~1024, dims rounded to multiples of 64.
     """
     a = (aspect or "16:9").strip().lower().replace(" ", "")
+    # "1920x1080"
     if "x" in a and ":" not in a:
         try:
             w, h = [int(x) for x in a.split("x")]
-            if w > 0 and h > 0:
-                return w, h, f"{w}:{h}"
-        except Exception:
-            pass
-    if ":" not in a:
-        presets = {
-            "square": (1024, 1024, "1:1"),
-            "portrait": (896, 1152, "7:9"),
-            "landscape": (1344, 768, "21:12"),
-        }
-        return presets.get(a, (1344, 768, "16:9"))
-
-    try:
-        num, den = a.split(":")
-        num = float(num); den = fl
